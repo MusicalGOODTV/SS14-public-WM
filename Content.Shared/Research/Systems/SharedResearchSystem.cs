@@ -1,5 +1,6 @@
 using System.Linq;
 using Content.Shared.Lathe;
+using Content.Shared.Research;
 using Content.Shared.Research.Components;
 using Content.Shared.Research.Prototypes;
 using JetBrains.Annotations;
@@ -32,18 +33,36 @@ public abstract class SharedResearchSystem : EntitySystem
         if (!Resolve(uid, ref component))
             return;
 
-        var availableTechnology = GetAvailableTechnologies(uid, component);
-        _random.Shuffle(availableTechnology);
-
         component.CurrentTechnologyCards.Clear();
-        foreach (var discipline in component.SupportedDisciplines)
+        if (component.WeeklyModeOnly)
         {
-            var selected = availableTechnology.FirstOrDefault(p => p.Discipline == discipline);
-            if (selected == null)
-                continue;
+            var availableWeeklyTechnology = GetAvailableWeeklyTechnologies(uid, component);
+            _random.Shuffle(availableWeeklyTechnology);
 
-            component.CurrentTechnologyCards.Add(selected.ID);
+            foreach (var discipline in component.SupportedDisciplines)
+            {
+                var selected = availableWeeklyTechnology.FirstOrDefault(p => p.Branch == discipline);
+                if (string.IsNullOrEmpty(selected.TechnologyId))
+                    continue;
+
+                component.CurrentTechnologyCards.Add(selected.TechnologyId);
+            }
         }
+        else
+        {
+            var availableTechnology = GetAvailableTechnologies(uid, component);
+            _random.Shuffle(availableTechnology);
+
+            foreach (var discipline in component.SupportedDisciplines)
+            {
+                var selected = availableTechnology.FirstOrDefault(p => p.Discipline == discipline);
+                if (selected == null)
+                    continue;
+
+                component.CurrentTechnologyCards.Add(selected.ID);
+            }
+        }
+
         Dirty(uid, component);
     }
 
@@ -52,11 +71,30 @@ public abstract class SharedResearchSystem : EntitySystem
         if (!Resolve(uid, ref component, false))
             return new List<TechnologyPrototype>();
 
+        if (component.WeeklyModeOnly)
+            return new List<TechnologyPrototype>();
+
         var availableTechnologies = new List<TechnologyPrototype>();
         var disciplineTiers = GetDisciplineTiers(component);
-        foreach (var tech in PrototypeManager.EnumeratePrototypes<TechnologyPrototype>())
+        foreach (var tech in EnumerateDatabaseTechnologies(component))
         {
             if (IsTechnologyAvailable(component, tech, disciplineTiers))
+                availableTechnologies.Add(tech);
+        }
+
+        return availableTechnologies;
+    }
+
+    public List<WeeklyTechnologyData> GetAvailableWeeklyTechnologies(EntityUid uid, TechnologyDatabaseComponent? component = null)
+    {
+        if (!Resolve(uid, ref component, false) || !component.WeeklyModeOnly)
+            return new List<WeeklyTechnologyData>();
+
+        var availableTechnologies = new List<WeeklyTechnologyData>();
+        var disciplineTiers = GetDisciplineTiers(component);
+        foreach (var tech in component.WeeklyTechnologies)
+        {
+            if (IsWeeklyTechnologyAvailable(component, tech, disciplineTiers))
                 availableTechnologies.Add(tech);
         }
 
@@ -88,6 +126,22 @@ public abstract class SharedResearchSystem : EntitySystem
         return true;
     }
 
+    public bool IsWeeklyTechnologyAvailable(TechnologyDatabaseComponent component, WeeklyTechnologyData tech, Dictionary<string, int>? disciplineTiers = null)
+    {
+        disciplineTiers ??= GetDisciplineTiers(component);
+
+        if (!component.SupportedDisciplines.Contains(tech.Branch))
+            return false;
+
+        if (!disciplineTiers.TryGetValue(tech.Branch, out var tier) || tech.Tier > tier)
+            return false;
+
+        if (component.WeeklyUnlockedTechnologies.Contains(tech.TechnologyId))
+            return false;
+
+        return true;
+    }
+
     public Dictionary<string, int> GetDisciplineTiers(TechnologyDatabaseComponent component)
     {
         var tiers = new Dictionary<string, int>();
@@ -106,7 +160,10 @@ public abstract class SharedResearchSystem : EntitySystem
 
     public int GetHighestDisciplineTier(TechnologyDatabaseComponent component, TechDisciplinePrototype techDiscipline)
     {
-        var allTech = PrototypeManager.EnumeratePrototypes<TechnologyPrototype>()
+        if (component.WeeklyModeOnly)
+            return GetHighestWeeklyDisciplineTier(component, techDiscipline);
+
+        var allTech = EnumerateDatabaseTechnologies(component)
             .Where(p => p.Discipline == techDiscipline.ID && !p.Hidden).ToList();
         var allUnlocked = new List<TechnologyPrototype>();
         foreach (var recipe in component.UnlockedTechnologies)
@@ -144,6 +201,57 @@ public abstract class SharedResearchSystem : EntitySystem
         }
 
         return tier - 1;
+    }
+
+    private int GetHighestWeeklyDisciplineTier(TechnologyDatabaseComponent component, TechDisciplinePrototype techDiscipline)
+    {
+        var allTech = component.WeeklyTechnologies
+            .Where(p => p.Branch == techDiscipline.ID)
+            .ToList();
+        var unlockedTech = allTech
+            .Where(p => component.WeeklyUnlockedTechnologies.Contains(p.TechnologyId))
+            .ToList();
+
+        var highestTier = techDiscipline.TierPrerequisites.Keys.Max();
+        var tier = 2; //tier 1 is always given
+
+        while (tier <= highestTier)
+        {
+            var unlockedTierTech = unlockedTech.Where(p => p.Tier == tier - 1).ToList();
+            var allTierTech = allTech.Where(p => p.Tier == tier - 1).ToList();
+
+            if (allTierTech.Count == 0)
+                break;
+
+            var percent = (float) unlockedTierTech.Count / allTierTech.Count;
+            if (percent < techDiscipline.TierPrerequisites[tier])
+                break;
+
+            if (tier >= techDiscipline.LockoutTier &&
+                component.MainDiscipline != null &&
+                techDiscipline.ID != component.MainDiscipline)
+                break;
+            tier++;
+        }
+
+        return tier - 1;
+    }
+
+    private IEnumerable<TechnologyPrototype> EnumerateDatabaseTechnologies(TechnologyDatabaseComponent component)
+    {
+        if (!component.WeeklyModeOnly)
+        {
+            foreach (var tech in PrototypeManager.EnumeratePrototypes<TechnologyPrototype>())
+                yield return tech;
+
+            yield break;
+        }
+
+        foreach (var id in component.WeeklyAllowedTechnologies.Distinct())
+        {
+            if (PrototypeManager.TryIndex<TechnologyPrototype>(id, out var tech))
+                yield return tech;
+        }
     }
 
     public FormattedMessage GetTechnologyDescription(
@@ -199,6 +307,41 @@ public abstract class SharedResearchSystem : EntitySystem
         return description;
     }
 
+    public FormattedMessage GetWeeklyTechnologyDescription(
+        WeeklyTechnologyData technology,
+        bool includeCost = true,
+        bool includeTier = true,
+        TechDisciplinePrototype? disciplinePrototype = null)
+    {
+        var description = new FormattedMessage();
+        if (includeTier)
+        {
+            disciplinePrototype ??= PrototypeManager.Index<TechDisciplinePrototype>(technology.Branch);
+            description.AddMarkupOrThrow(Loc.GetString("research-console-tier-discipline-info",
+                ("tier", technology.Tier), ("color", disciplinePrototype.Color), ("discipline", Loc.GetString(disciplinePrototype.Name))));
+            description.PushNewline();
+        }
+
+        if (includeCost)
+        {
+            description.AddMarkupOrThrow(Loc.GetString("research-console-cost", ("amount", technology.Cost)));
+            description.PushNewline();
+        }
+
+        description.AddMarkupOrThrow(Loc.GetString("research-console-unlocks-list-start"));
+        foreach (var recipe in technology.RecipeIds)
+        {
+            description.PushNewline();
+            var recipeName = PrototypeManager.TryIndex<LatheRecipePrototype>(recipe, out var recipeProto)
+                ? _lathe.GetRecipeName(recipeProto)
+                : recipe;
+            description.AddMarkupOrThrow(Loc.GetString("research-console-unlocks-list-entry",
+                ("name", recipeName)));
+        }
+
+        return description;
+    }
+
     /// <summary>
     ///     Returns whether a technology is unlocked on this database or not.
     /// </summary>
@@ -214,7 +357,12 @@ public abstract class SharedResearchSystem : EntitySystem
     /// <returns>Whether it is unlocked or not</returns>
     public bool IsTechnologyUnlocked(EntityUid uid, string technologyId, TechnologyDatabaseComponent? component = null)
     {
-        return Resolve(uid, ref component, false) && component.UnlockedTechnologies.Contains(technologyId);
+        if (!Resolve(uid, ref component, false))
+            return false;
+
+        return component.WeeklyModeOnly
+            ? component.WeeklyUnlockedTechnologies.Contains(technologyId)
+            : component.UnlockedTechnologies.Contains(technologyId);
     }
 
     public void TrySetMainDiscipline(TechnologyPrototype prototype, EntityUid uid, TechnologyDatabaseComponent? component = null)
@@ -279,10 +427,12 @@ public abstract class SharedResearchSystem : EntitySystem
     [PublicAPI]
     public void ClearTechs(EntityUid uid, TechnologyDatabaseComponent? comp = null)
     {
-        if (!Resolve(uid, ref comp) || comp.UnlockedTechnologies.Count == 0)
+        if (!Resolve(uid, ref comp) ||
+            comp.UnlockedTechnologies.Count == 0 && comp.WeeklyUnlockedTechnologies.Count == 0)
             return;
 
         comp.UnlockedTechnologies.Clear();
+        comp.WeeklyUnlockedTechnologies.Clear();
         Dirty(uid, comp);
     }
 

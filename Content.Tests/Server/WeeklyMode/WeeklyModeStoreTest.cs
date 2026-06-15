@@ -255,6 +255,16 @@ public sealed class WeeklyModeStoreTest
                     })
             },
         };
+        var actor = new MappingDataNode
+        {
+            { "type", new ValueDataNode("Actor") },
+        };
+        var mindContainer = new MappingDataNode
+        {
+            { "type", new ValueDataNode("MindContainer") },
+            { "mind", new ValueDataNode("99") },
+            { "hasMind", new ValueDataNode("true") },
+        };
         var data = SerializedMapData(
             "Saltern",
             stationMember,
@@ -268,7 +278,9 @@ public sealed class WeeklyModeStoreTest
             vendingMachine,
             bin,
             cartridgeLoader,
-            lightReplacer);
+            lightReplacer,
+            actor,
+            mindContainer);
         var entity = SerializedEntity(data);
         entity.Add("mapInit", new ValueDataNode("true"));
         entity.Add("paused", new ValueDataNode("true"));
@@ -287,6 +299,7 @@ public sealed class WeeklyModeStoreTest
             Assert.That(result.RemovedSuitSensorEntityReferences, Is.EqualTo(2));
             Assert.That(result.RemovedInvalidContainerReferences, Is.EqualTo(2));
             Assert.That(result.ResetMapInitializationFields, Is.EqualTo(4));
+            Assert.That(result.ResetMindContainers, Is.EqualTo(3));
             Assert.That(result.SuppressedMapInitOnlyComponents, Is.EqualTo(1));
             Assert.That(result.SuppressedStartingItems, Is.EqualTo(23));
             Assert.That(entity.ContainsKey("mapInit"), Is.False);
@@ -294,7 +307,10 @@ public sealed class WeeklyModeStoreTest
             Assert.That(mapComponent.ContainsKey("mapInitialized"), Is.False);
             Assert.That(mapComponent.ContainsKey("mapPaused"), Is.False);
             Assert.That(components.OfType<MappingDataNode>().Any(x => ComponentType(x) == "StationMember"), Is.False);
+            Assert.That(components.OfType<MappingDataNode>().Any(x => ComponentType(x) == "Actor"), Is.False);
             Assert.That(components.OfType<MappingDataNode>().Any(x => ComponentType(x) == "ContainerFill"), Is.False);
+            Assert.That(mindContainer.ContainsKey("mind"), Is.False);
+            Assert.That(mindContainer.Get<ValueDataNode>("hasMind").Value, Is.EqualTo("false"));
             Assert.That(suitSensor.ContainsKey("station"), Is.False);
             Assert.That(suitSensor.ContainsKey("user"), Is.False);
             Assert.That(suitSensor.ContainsKey("mode"), Is.True);
@@ -392,6 +408,132 @@ public sealed class WeeklyModeStoreTest
             Assert.That(loaded.Snapshots, Contains.Item(snapshotId));
             Assert.That(store.TryLoadSnapshot(setId, snapshotId, out var metadata), Is.True);
             Assert.That(metadata!.Notes, Is.EqualTo("listed bundle"));
+        });
+    }
+
+    [Test]
+    public void CampaignConfigPersistsRoleLimitsAutosaveWarningAndCyrillicAliases()
+    {
+        using var ctx = CreateContext();
+        var store = ctx.Store;
+        const string setId = "season-01";
+        var set = store.CreateSet(setId, "Packed", 30, 8, baseMapPath: "/Maps/saltern.yml");
+
+        set.AutosaveWarningMinutes = 2;
+        set.DefaultRoleAliases["Passenger"] = "Поселенец";
+        set.DefaultRoleLimits["Passenger"] = 20;
+        set.DefaultRoleLimits["StationEngineer"] = 3;
+        set.DefaultRoleLimits["Captain"] = 1;
+        store.SaveSet(set);
+
+        var loaded = store.LoadSet(setId);
+        var json = ctx.UserData.ReadAllText(store.SetPath(setId));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(loaded.AutosaveMinutes, Is.EqualTo(30));
+            Assert.That(loaded.AutosaveWarningMinutes, Is.EqualTo(2));
+            Assert.That(loaded.BaseMapPath, Is.EqualTo("/Maps/saltern.yml"));
+            Assert.That(loaded.DefaultRoleAliases["Passenger"], Is.EqualTo("Поселенец"));
+            Assert.That(loaded.DefaultRoleLimits["Passenger"], Is.EqualTo(20));
+            Assert.That(loaded.DefaultRoleLimits["StationEngineer"], Is.EqualTo(3));
+            Assert.That(loaded.DefaultRoleLimits["Captain"], Is.EqualTo(1));
+            Assert.That(json, Does.Contain("Поселенец"));
+            Assert.That(SetDirectoryEntries(ctx.UserData, store, setId), Has.None.StartsWith(".tmp-"));
+            Assert.That(SetDirectoryEntries(ctx.UserData, store, setId), Has.None.StartsWith(".backup-"));
+        });
+    }
+
+    [Test]
+    public void CampaignConfigPersistsWeeklyRuntimeSettings()
+    {
+        using var ctx = CreateContext();
+        var store = ctx.Store;
+        const string setId = "season-runtime";
+        var set = store.CreateSet(setId, "Packed", 30, 8, baseMapPath: "/Maps/saltern.yml");
+
+        set.PersistAutonomousMobs = false;
+        set.PersistPlayerControlledBorgs = true;
+        set.ExcludedMobPrototypes.Remove("MobMouse");
+        set.ExcludedMobPrototypes.Add("MobHamster");
+        set.MinPlaytimeHours = 10;
+        set.DiscordChannel = "#weekly-event";
+        set.RandomGameRulesEnabled = false;
+        set.WeeklyTechnologies.Add(new WeeklyTechnologyEntry
+        {
+            TechnologyId = "AdvancedTools",
+            Branch = "industrial",
+            Cost = 7500,
+            Tier = 1,
+            RecipeIds = { "PowerDrillRecipe", "AdvancedWelderRecipe" },
+        });
+        set.WeeklyCargoProducts.Add(new WeeklyCargoProductEntry
+        {
+            ProductId = "SteelOrder",
+            Category = "Resources",
+            Cost = 1500,
+            Boxed = true,
+            Amount = 30,
+            ItemPrototype = "SheetSteel",
+        });
+
+        store.SaveSet(set);
+
+        var loaded = store.LoadSet(setId);
+        var json = ctx.UserData.ReadAllText(store.SetPath(setId));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(loaded.PersistAutonomousMobs, Is.False);
+            Assert.That(loaded.PersistPlayerControlledBorgs, Is.True);
+            Assert.That(loaded.ExcludedMobPrototypes, Does.Not.Contain("MobMouse"));
+            Assert.That(loaded.ExcludedMobPrototypes, Contains.Item("MobHamster"));
+            Assert.That(loaded.MinPlaytimeHours, Is.EqualTo(10));
+            Assert.That(loaded.DiscordChannel, Is.EqualTo("#weekly-event"));
+            Assert.That(loaded.RandomGameRulesEnabled, Is.False);
+            Assert.That(loaded.WeeklyTechnologies, Has.Count.EqualTo(1));
+            Assert.That(loaded.WeeklyTechnologies[0].TechnologyId, Is.EqualTo("AdvancedTools"));
+            Assert.That(loaded.WeeklyTechnologies[0].RecipeIds, Is.EqualTo(new[] { "PowerDrillRecipe", "AdvancedWelderRecipe" }));
+            Assert.That(loaded.WeeklyCargoProducts, Has.Count.EqualTo(1));
+            Assert.That(loaded.WeeklyCargoProducts[0].ProductId, Is.EqualTo("SteelOrder"));
+            Assert.That(loaded.WeeklyCargoProducts[0].Amount, Is.EqualTo(30));
+            Assert.That(json, Does.Contain("\"PersistAutonomousMobs\""));
+            Assert.That(json, Does.Contain("\"WeeklyTechnologies\""));
+            Assert.That(json, Does.Contain("\"WeeklyCargoProducts\""));
+            Assert.That(SetDirectoryEntries(ctx.UserData, store, setId), Has.None.StartsWith(".tmp-"));
+            Assert.That(SetDirectoryEntries(ctx.UserData, store, setId), Has.None.StartsWith(".backup-"));
+        });
+    }
+
+    [Test]
+    public void SnapshotRoleOverridesPersistRoleLimits()
+    {
+        using var ctx = CreateContext();
+        var store = ctx.Store;
+        const string setId = "season-01";
+        const string snapshotId = "manual-20260614-100002-limits";
+        var temp = store.TempSnapshotDirectory(setId, snapshotId);
+
+        WriteFullBundle(store, ctx.UserData, temp, setId, snapshotId, "role limits");
+        store.SaveRoleOverrides(temp, new WeeklyRoleOverrides
+        {
+            DisabledJobs = { "Botanist" },
+            RoleAliases = { ["Passenger"] = "Поселенец" },
+            RoleLimits =
+            {
+                ["Passenger"] = 20,
+                ["Captain"] = 1,
+            },
+        });
+        store.ReplaceSnapshotDirectory(temp, setId, snapshotId);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(store.TryLoadRoleOverrides(setId, snapshotId, out var overrides), Is.True);
+            Assert.That(overrides!.DisabledJobs, Contains.Item("Botanist"));
+            Assert.That(overrides.RoleAliases["Passenger"], Is.EqualTo("Поселенец"));
+            Assert.That(overrides.RoleLimits["Passenger"], Is.EqualTo(20));
+            Assert.That(overrides.RoleLimits["Captain"], Is.EqualTo(1));
         });
     }
 
@@ -521,6 +663,7 @@ public sealed class WeeklyModeStoreTest
             SnapshotId = snapshotId,
             Kind = WeeklySnapshotKind.Manual,
             BaseMapPrototype = "Packed",
+            BaseMapPath = "/Maps/packed.yml",
             CreatedAtUtc = DateTime.UtcNow,
             Notes = note,
             CreatedBy = "test",
@@ -596,6 +739,11 @@ public sealed class WeeklyModeStoreTest
     private static string[] SnapshotDirectoryEntries(IWritableDirProvider userData, WeeklyModeStore store, string setId)
     {
         return userData.DirectoryEntries(store.SnapshotsDirectory(setId)).ToArray();
+    }
+
+    private static string[] SetDirectoryEntries(IWritableDirProvider userData, WeeklyModeStore store, string setId)
+    {
+        return userData.DirectoryEntries(store.SetDirectory(setId)).ToArray();
     }
 
     private sealed class WeeklyModeStoreTestContext : IDisposable

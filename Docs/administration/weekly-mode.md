@@ -4,25 +4,28 @@ Weekly Mode - серверный режим для длительной камп
 
 ## Включение
 
-Режим выключен по умолчанию.
+Режим включен по умолчанию.
 
 ```cfg
 weekly_mode.enabled: true
 weekly_mode.data_root: /weekly-mode
-weekly_mode.default_autosave_minutes: 10
+weekly_mode.default_autosave_minutes: 30
 weekly_mode.default_retain_autosaves: 8
 ```
 
-Файлы пишутся в user data, по умолчанию в `/weekly-mode/sets/<setId>/`.
+Файлы пишутся в user data, по умолчанию в `/weekly-mode/sets/<setId>/`. Новый set по умолчанию использует autosave каждые 30 минут и OOC-предупреждение за 2 минуты.
 
 ## Создание set
 
 ```text
-wm.set.create <setId> <baseMapPrototype> [displayName]
+wm.set.create <setId> <mapPath> [displayName]
+wm.set.map <setId> <mapPath>
 wm.set.list
 ```
 
 `setId` принимает только ASCII-буквы, цифры, `-`, `_`, `.`. Пути, слеши и `..` запрещены.
+
+`mapPath` - rooted resource path до `.yml` карты, например `/Maps/saltern.yml`. OS-пути вроде `C:/...`, UNC-пути и traversal через `..` запрещены. В текущей реализации файл карты должен иметь соответствующий `GameMapPrototype`, потому что round loader берет из прототипа станционные настройки.
 
 ## Роли
 
@@ -44,6 +47,28 @@ wm.roles.rename-clear <setId> [jobId...]
 ```
 
 Alias поддерживает Unicode, но запрещает управляющие символы и markup brackets.
+
+Лимиты ролей хранятся в config set-а и применяются к station job slots при старте Weekly round:
+
+```text
+wm.roles.limit <setId> <jobId> <count>
+wm.roles.limits <setId>
+wm.roles.limit-clear <setId> <jobId>
+wm.roles.limit-clear-all <setId>
+```
+
+Отключение роли имеет приоритет над лимитом. Изменять роли активного set-а нельзя: сначала остановите кампанию через `wm.stop`.
+
+## Конфиг
+
+```text
+wm.autosave.set <setId> <intervalMinutes> <warningMinutes>
+wm.config.show <setId>
+wm.config.validate <setId>
+wm.config.export <setId>
+```
+
+`wm.start` выполняет validation перед запуском и отклоняет config с неизвестными job/map prototype, некорректным map path, отрицательными лимитами или warning, который не меньше autosave interval.
 
 ## Старт
 
@@ -104,9 +129,12 @@ wm.rollback <setId> <snapshotId> --force
 
 ```text
 wm.cancel
+wm.stop <setId>
 ```
 
 После отмены будущие раунды используют обычный выбор карты. Runtime role aliases автоматически перестают применяться, потому что resolver активен только во время Weekly Mode.
+
+`wm.stop` останавливает активную кампанию без удаления config или snapshots и восстанавливает runtime job slot overrides.
 
 ## Расположение файлов
 

@@ -54,6 +54,11 @@ public interface IGameMapManager
     void SelectMap(string gameMap);
 
     /// <summary>
+    /// Selects a map prototype while replacing its content map path for this selection only.
+    /// </summary>
+    void SelectMapPath(string baseMapPrototype, ResPath mapPath);
+
+    /// <summary>
     /// Selects a map prototype, replacing its map path with a saved user-data map if it exists.
     /// Falls back to the base map prototype if the saved map path is missing.
     /// </summary>

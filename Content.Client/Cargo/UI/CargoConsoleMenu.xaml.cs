@@ -11,6 +11,7 @@ using Robust.Client.UserInterface.Controls;
 using Robust.Client.UserInterface.XAML;
 using Robust.Shared.Prototypes;
 using Robust.Shared.Timing;
+using Robust.Shared.Utility;
 using static Robust.Client.UserInterface.Controls.BaseButton;
 
 namespace Content.Client.Cargo.UI
@@ -42,6 +43,7 @@ namespace Content.Client.Cargo.UI
         private string? _category;
 
         public List<ProtoId<CargoProductPrototype>> ProductCatalogue = new();
+        public List<WeeklyCargoProductData> WeeklyProductCatalogue = new();
 
         public CargoConsoleMenu(EntityUid owner, IEntityManager entMan, IPrototypeManager protoManager, SpriteSystem spriteSystem)
         {
@@ -134,34 +136,110 @@ namespace Content.Client.Cargo.UI
             }
         }
 
+        private sealed class ProductDisplayData
+        {
+            public string ProductId = string.Empty;
+            public string Name = string.Empty;
+            public string Description = string.Empty;
+            public string Category = string.Empty;
+            public int Cost;
+            public SpriteSpecifier Icon = SpriteSpecifier.Invalid;
+            public CargoProductPrototype? Product;
+            public WeeklyCargoProductData? WeeklyProduct;
+        }
+
+        private static string LocalizeOrLiteral(string value)
+        {
+            return Loc.TryGetString(value, out var localized)
+                ? localized
+                : value;
+        }
+
+        private List<ProductDisplayData> BuildProductDisplayData()
+        {
+            var products = new List<ProductDisplayData>();
+
+            foreach (var prototype in ProductPrototypes)
+            {
+                products.Add(new ProductDisplayData
+                {
+                    ProductId = prototype.ID,
+                    Name = prototype.Name,
+                    Description = prototype.Description,
+                    Category = LocalizeOrLiteral(prototype.Category),
+                    Cost = prototype.Cost,
+                    Icon = prototype.Icon,
+                    Product = prototype,
+                });
+            }
+
+            foreach (var product in WeeklyProductCatalogue)
+            {
+                products.Add(new ProductDisplayData
+                {
+                    ProductId = product.ProductId,
+                    Name = product.Name,
+                    Description = product.Description,
+                    Category = LocalizeOrLiteral(product.Category),
+                    Cost = product.Cost,
+                    Icon = product.Icon,
+                    WeeklyProduct = product,
+                });
+            }
+
+            products.Sort((x, y) =>
+                string.Compare(x.Name, y.Name, StringComparison.CurrentCultureIgnoreCase));
+
+            return products;
+        }
+
+        public bool TryGetProductDisplayData(string productId, out string name, out string description, out int cost)
+        {
+            foreach (var product in BuildProductDisplayData())
+            {
+                if (!string.Equals(product.ProductId, productId, StringComparison.Ordinal))
+                    continue;
+
+                name = product.Name;
+                description = product.Description;
+                cost = product.Cost;
+                return true;
+            }
+
+            name = string.Empty;
+            description = string.Empty;
+            cost = 0;
+            return false;
+        }
+
         /// <summary>
         ///     Populates the list of products that will actually be shown, using the current filters.
         /// </summary>
         public void PopulateProducts()
         {
             Products.RemoveAllChildren();
-            var products = ProductPrototypes.ToList();
-            products.Sort((x, y) =>
-                string.Compare(x.Name, y.Name, StringComparison.CurrentCultureIgnoreCase));
+            var products = BuildProductDisplayData();
 
             var search = SearchBar.Text.Trim().ToLowerInvariant();
-            foreach (var prototype in products)
+            foreach (var product in products)
             {
                 // if no search or category
                 // else if search
                 // else if category and not search
                 if (search.Length == 0 && _category == null ||
-                    search.Length != 0 && prototype.Name.ToLowerInvariant().Contains(search) ||
-                    search.Length != 0 && prototype.Description.ToLowerInvariant().Contains(search) ||
-                    search.Length == 0 && _category != null && Loc.GetString(prototype.Category).Equals(_category))
+                    search.Length != 0 && product.Name.ToLowerInvariant().Contains(search) ||
+                    search.Length != 0 && product.Description.ToLowerInvariant().Contains(search) ||
+                    search.Length == 0 && _category != null && product.Category.Equals(_category))
                 {
                     var button = new CargoProductRow
                     {
-                        Product = prototype,
-                        ProductName = { Text = prototype.Name },
-                        MainButton = { ToolTip = prototype.Description },
-                        PointCost = { Text = Loc.GetString("cargo-console-menu-points-amount", ("amount", prototype.Cost.ToString())) },
-                        Icon = { Texture = _spriteSystem.Frame0(prototype.Icon) },
+                        Product = product.Product,
+                        WeeklyProduct = product.WeeklyProduct,
+                        ProductId = product.ProductId,
+                        ProductName = { Text = product.Name },
+                        MainButton = { ToolTip = product.Description },
+                        PointCost = { Text = Loc.GetString("cargo-console-menu-points-amount", ("amount", product.Cost.ToString())) },
+                        Icon = { Texture = _spriteSystem.Frame0(product.Icon) },
                     };
                     button.MainButton.OnPressed += args =>
                     {
@@ -180,15 +258,18 @@ namespace Content.Client.Cargo.UI
             _categoryStrings.Clear();
             Categories.Clear();
 
-            foreach (var prototype in ProductPrototypes)
+            foreach (var product in BuildProductDisplayData())
             {
-                if (!_categoryStrings.Contains(Loc.GetString(prototype.Category)))
+                if (!_categoryStrings.Contains(product.Category))
                 {
-                    _categoryStrings.Add(Loc.GetString(prototype.Category));
+                    _categoryStrings.Add(product.Category);
                 }
             }
 
             _categoryStrings.Sort();
+
+            if (_category != null && !_categoryStrings.Contains(_category))
+                _category = null;
 
             // Add "All" category at the top of the list
             _categoryStrings.Insert(0, Loc.GetString("cargo-console-menu-populate-categories-all-text"));
@@ -197,6 +278,9 @@ namespace Content.Client.Cargo.UI
             {
                 Categories.AddItem(str);
             }
+
+            var selected = _category == null ? 0 : _categoryStrings.IndexOf(_category);
+            Categories.SelectId(Math.Max(0, selected));
         }
 
         /// <summary>
@@ -211,11 +295,30 @@ namespace Content.Client.Cargo.UI
 
             foreach (var order in orders)
             {
-                if (order.Approved || !_protoManager.Resolve(order.Product, out var productProto))
+                if (order.Approved)
                     continue;
 
-                var product = _protoManager.Index<EntityPrototype>(productProto.Product);
-                var productName = productProto.Name;
+                string productName;
+                int productCost;
+                Texture? icon;
+
+                if (order.IsWeeklyProduct)
+                {
+                    productName = order.WeeklyProduct.Name;
+                    productCost = order.WeeklyProduct.Cost;
+                    icon = _spriteSystem.Frame0(order.WeeklyProduct.Icon);
+                }
+                else
+                {
+                    if (!_protoManager.Resolve<CargoProductPrototype>(order.Product, out var productProto))
+                        continue;
+
+                    var product = _protoManager.Index<EntityPrototype>(productProto.Product);
+                    productName = productProto.Name;
+                    productCost = productProto.Cost;
+                    icon = _spriteSystem.Frame0(product);
+                }
+
                 var requester = !string.IsNullOrEmpty(order.Requester) ?
                     order.Requester : Loc.GetString("cargo-console-menu-order-row-alerts-requester-unknown");
                 var account = _protoManager.Index(order.Account);
@@ -230,7 +333,7 @@ namespace Content.Client.Cargo.UI
                             "cargo-console-menu-order-row-title",
                             ("productName", productName),
                             ("orderAmount", order.OrderQuantity),
-                            ("orderPrice", productProto.Cost)),
+                            ("orderPrice", productCost)),
                     },
 
                     Stride =
@@ -242,7 +345,7 @@ namespace Content.Client.Cargo.UI
                         },
                     },
 
-                    Icon = { Texture = _spriteSystem.Frame0(product) },
+                    Icon = { Texture = icon },
 
                     ProductName =
                     {

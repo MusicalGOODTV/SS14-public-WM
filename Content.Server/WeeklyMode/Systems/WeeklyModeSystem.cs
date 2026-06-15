@@ -2,16 +2,25 @@ using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text.Json;
+using Content.Server.Cargo.Systems;
 using Content.Server.Chemistry.Components;
 using Content.Server.Chat.Managers;
 using Content.Server.GameTicking;
+using Content.Server.GameTicking.Events;
 using Content.Server.Light.EntitySystems;
 using Content.Server.Maps;
+using Content.Server.Players.PlayTimeTracking;
+using Content.Server.Research.Systems;
 using Content.Server.Spawners.Components;
+using Content.Server.Station.Events;
 using Content.Server.Station.Components;
 using Content.Server.Station.Systems;
 using Content.Shared.Actions;
 using Content.Shared.CartridgeLoader;
+using Content.Shared.Cargo;
+using Content.Shared.Cargo.Prototypes;
+using Content.Shared.Chat;
 using Content.Shared.Containers;
 using Content.Shared.Containers.ItemSlots;
 using Content.Server.WeeklyMode.Storage;
@@ -19,10 +28,18 @@ using Content.Shared.CCVar;
 using Content.Shared.GameTicking;
 using Content.Shared.Ghost;
 using Content.Shared.Light.Components;
+using Content.Shared.Lathe;
 using Content.Shared.Maps;
 using Content.Shared.Mind;
 using Content.Shared.Mind.Components;
+using Content.Shared.Mobs.Components;
+using Content.Shared.Players.PlayTimeTracking;
+using Content.Shared.Research;
+using Content.Shared.Research.Components;
+using Content.Shared.Research.Prototypes;
 using Content.Shared.Roles;
+using Content.Shared.Silicons.Borgs;
+using Content.Shared.Silicons.Borgs.Components;
 using Content.Shared.Storage.Components;
 using Content.Shared.Storage.EntitySystems;
 using Content.Shared.VendingMachines;
@@ -38,6 +55,7 @@ using Robust.Shared.EntitySerialization.Systems;
 using Robust.Shared.GameObjects;
 using Robust.Shared.Map;
 using Robust.Shared.Map.Components;
+using Robust.Shared.Network;
 using Robust.Shared.Serialization;
 using Robust.Shared.Serialization.Markdown;
 using Robust.Shared.Player;
@@ -54,6 +72,16 @@ namespace Content.Server.WeeklyMode.Systems;
 
 public sealed class WeeklyModeSystem : EntitySystem
 {
+    private const int WeeklyCargoBoxedCapacity = 30;
+
+    [Flags]
+    private enum WeeklyLiveConfigChange
+    {
+        None = 0,
+        Research = 1,
+        Cargo = 2,
+    }
+
     [Dependency] private readonly IConfigurationManager _cfg = default!;
     [Dependency] private readonly IGameMapManager _gameMapManager = default!;
     [Dependency] private readonly IGameTiming _timing = default!;
@@ -71,10 +99,16 @@ public sealed class WeeklyModeSystem : EntitySystem
     [Dependency] private readonly LightReplacerSystem _lightReplacer = default!;
     [Dependency] private readonly ActionGrantSystem _actionGrant = default!;
     [Dependency] private readonly BinSystem _bin = default!;
+    [Dependency] private readonly PlayTimeTrackingManager _playTime = default!;
+    [Dependency] private readonly ResearchSystem _research = default!;
+    [Dependency] private readonly SharedBorgSystem _borg = default!;
+    [Dependency] private readonly SharedMindSystem _mind = default!;
 
     private readonly WeeklyModeRuntimeState _state = new();
     private readonly Dictionary<EntityUid, Dictionary<string, int?>> _originalSlots = new();
     private readonly Dictionary<string, RollbackConfirmation> _rollbackConfirmations = new();
+    private readonly HashSet<NetUserId> _accessLobbyNoticeSent = new();
+    private readonly Dictionary<NetUserId, TimeSpan> _accessNoticeCooldowns = new();
 
     private EntityQuery<TransformComponent> _xformQuery;
     private EntityQuery<MetaDataComponent> _metaQuery;
@@ -89,6 +123,7 @@ public sealed class WeeklyModeSystem : EntitySystem
     private bool _enabled;
     private bool _operationInProgress;
     private TimeSpan? _nextAutosaveAt;
+    private bool _autosaveWarningIssued;
     private MapId? _activeWeeklyMapId;
     private EntityUid? _activeWeeklyMapEntity;
     private readonly List<EntityUid> _activeWeeklyGridIds = new();
@@ -101,6 +136,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         int RemovedSuitSensorEntityReferences,
         int RemovedInvalidContainerReferences,
         int ResetMapInitializationFields,
+        int ResetMindContainers,
         int SuppressedMapInitOnlyComponents,
         int SuppressedStartingItems)
     {
@@ -108,6 +144,7 @@ public sealed class WeeklyModeSystem : EntitySystem
                                RemovedSuitSensorEntityReferences > 0 ||
                                RemovedInvalidContainerReferences > 0 ||
                                ResetMapInitializationFields > 0 ||
+                               ResetMindContainers > 0 ||
                                SuppressedMapInitOnlyComponents > 0 ||
                                SuppressedStartingItems > 0;
     }
@@ -122,6 +159,22 @@ public sealed class WeeklyModeSystem : EntitySystem
         "RandomSpawner",
         "StorageFill",
         "RandomFillSolution",
+    };
+
+    private static readonly HashSet<string> WeeklyTechnologyBranches = new(StringComparer.Ordinal)
+    {
+        "industrial",
+        "arsenal",
+        "experimental",
+        "service",
+    };
+
+    private static readonly Dictionary<string, string> WeeklyTechnologyDisciplineIds = new(StringComparer.Ordinal)
+    {
+        ["industrial"] = "Industrial",
+        ["arsenal"] = "Arsenal",
+        ["experimental"] = "Experimental",
+        ["service"] = "CivilianServices",
     };
 
     public override void Initialize()
@@ -151,6 +204,10 @@ public sealed class WeeklyModeSystem : EntitySystem
         SubscribeLocalEvent<PostGameMapLoad>(OnPostGameMapLoad);
         SubscribeLocalEvent<StationInitializedEvent>(OnStationInitialized);
         SubscribeLocalEvent<RoundStartedEvent>(OnRoundStarted);
+        SubscribeLocalEvent<PlayerJoinedLobbyEvent>(OnPlayerJoinedLobby);
+        SubscribeLocalEvent<StationJobsGetCandidatesEvent>(OnStationJobsGetCandidates);
+        SubscribeLocalEvent<IsRoleAllowedEvent>(OnIsRoleAllowed);
+        SubscribeLocalEvent<GetDisallowedJobsEvent>(OnGetDisallowedJobs);
     }
 
     public override void Update(float frameTime)
@@ -160,8 +217,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             _operationInProgress ||
             _state.ActiveSetId == null ||
             _gameTicker.RunLevel != GameRunLevel.InRound ||
-            _nextAutosaveAt == null ||
-            _timing.CurTime < _nextAutosaveAt.Value)
+            _nextAutosaveAt == null)
         {
             return;
         }
@@ -170,16 +226,42 @@ public sealed class WeeklyModeSystem : EntitySystem
         {
             _sawmill.Error($"Weekly autosave skipped: active set '{_state.ActiveSetId}' is missing.");
             _nextAutosaveAt = _timing.CurTime + TimeSpan.FromMinutes(1);
+            _autosaveWarningIssued = false;
             return;
         }
 
-        if (!TrySaveSnapshot(set.SetId, WeeklySnapshotKind.Auto, "scheduled autosave", "server", out var message))
+        var timeUntilSave = _nextAutosaveAt.Value - _timing.CurTime;
+        if (!_autosaveWarningIssued &&
+            set.AutosaveWarningMinutes > 0 &&
+            timeUntilSave > TimeSpan.Zero &&
+            timeUntilSave <= TimeSpan.FromMinutes(set.AutosaveWarningMinutes))
+        {
+            SendAutosaveOoc(
+                $"Внимание! Через {set.AutosaveWarningMinutes} минуты будет выполнено автоматическое сохранение мира.\n\n" +
+                "Во время сохранения возможна кратковременная задержка или подвисание игры.");
+            _autosaveWarningIssued = true;
+        }
+
+        if (_timing.CurTime < _nextAutosaveAt.Value)
+            return;
+
+        SendAutosaveOoc("Начинается автоматическое сохранение мира. Возможна кратковременная задержка.");
+
+        if (TrySaveSnapshot(set.SetId, WeeklySnapshotKind.Auto, "scheduled autosave", "server", out var message))
+        {
+            SendAutosaveOoc("Автоматическое сохранение мира завершено.");
+        }
+        else
+        {
             _sawmill.Warning($"Weekly autosave failed: {message}");
+            SendAutosaveOoc("Автоматическое сохранение мира завершилось ошибкой. Администраторы уведомлены.");
+        }
 
         _nextAutosaveAt = _timing.CurTime + TimeSpan.FromMinutes(Math.Max(1, set.AutosaveMinutes));
+        _autosaveWarningIssued = false;
     }
 
-    public bool TryCreateSet(string setId, string baseMapPrototype, string? displayName, out string message)
+    public bool TryCreateSet(string setId, string mapPath, string? displayName, out string message)
     {
         if (!WeeklyModeStore.IsSafeId(setId))
         {
@@ -187,11 +269,8 @@ public sealed class WeeklyModeSystem : EntitySystem
             return false;
         }
 
-        if (!_prototype.TryIndex<GameMapPrototype>(baseMapPrototype, out _))
-        {
-            message = $"Unknown map prototype '{baseMapPrototype}'.";
+        if (!TryResolveBaseMapPath(mapPath, out var baseMap, out var resolvedMapPath, out message))
             return false;
-        }
 
         if (_store.TryLoadSet(setId, out _))
         {
@@ -201,9 +280,24 @@ public sealed class WeeklyModeSystem : EntitySystem
 
         var autosaveMinutes = _cfg.GetCVar(CCVars.WeeklyModeDefaultAutosaveMinutes);
         var retainAutosaves = _cfg.GetCVar(CCVars.WeeklyModeDefaultRetainAutosaves);
-        var set = _store.CreateSet(setId, baseMapPrototype, autosaveMinutes, retainAutosaves, displayName);
-        message = $"Created weekly set '{set.SetId}' with base map '{set.BaseMapPrototype}'.";
+        var set = _store.CreateSet(setId, baseMap.ID, autosaveMinutes, retainAutosaves, displayName, resolvedMapPath.CanonPath);
+        message = $"Created weekly set '{set.SetId}' with base map path '{set.BaseMapPath}' using map prototype '{set.BaseMapPrototype}'.";
         _sawmill.Info(message);
+        return true;
+    }
+
+    public bool TrySetMap(string setId, string mapPath, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!TryResolveBaseMapPath(mapPath, out var baseMap, out var resolvedMapPath, out message))
+            return false;
+
+        set.BaseMapPrototype = baseMap.ID;
+        set.BaseMapPath = resolvedMapPath.CanonPath;
+        _store.SaveSet(set);
+        message = $"Weekly set '{set.SetId}' map changed to '{set.BaseMapPath}' using map prototype '{set.BaseMapPrototype}'.";
         return true;
     }
 
@@ -219,7 +313,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             if (!_store.TryLoadSet(id, out var set))
                 continue;
 
-            lines.Add($"- {set.SetId}: base={set.BaseMapPrototype}, current={set.CurrentSnapshot ?? "<base>"}, autosave={set.AutosaveMinutes}m, retain={set.RetainAutosaves}");
+            lines.Add($"- {set.SetId}: base={DescribeBaseMap(set)}, current={set.CurrentSnapshot ?? "<base>"}, autosave={set.AutosaveMinutes}m, warning={set.AutosaveWarningMinutes}m, retain={set.RetainAutosaves}");
         }
 
         return string.Join('\n', lines);
@@ -253,7 +347,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         if (!_store.TryLoadSet(setId, out var set))
             return $"Weekly set '{setId}' was not found.";
 
-        return $"Set '{set.SetId}': base={set.BaseMapPrototype}, current={set.CurrentSnapshot ?? "<base>"}, disabled=[{string.Join(", ", set.DefaultDisabledJobs)}], aliases={set.DefaultRoleAliases.Count}, snapshots={set.Snapshots.Count}.";
+        return $"Set '{set.SetId}': base={DescribeBaseMap(set)}, current={set.CurrentSnapshot ?? "<base>"}, disabled=[{string.Join(", ", set.DefaultDisabledJobs)}], aliases={set.DefaultRoleAliases.Count}, limits={set.DefaultRoleLimits.Count}, snapshots={set.Snapshots.Count}.";
     }
 
     public string ListSnapshots(string setId)
@@ -340,6 +434,12 @@ public sealed class WeeklyModeSystem : EntitySystem
             if (!_store.TryLoadSet(setId, out var set))
             {
                 message = $"Weekly set '{setId}' was not found.";
+                return false;
+            }
+
+            if (!TryValidateSetConfig(set, out var validationErrors))
+            {
+                message = $"Weekly set '{set.SetId}' config is invalid:\n- {string.Join("\n- ", validationErrors)}";
                 return false;
             }
 
@@ -500,17 +600,44 @@ public sealed class WeeklyModeSystem : EntitySystem
 
         try
         {
-            _state.IsActive = false;
-            _state.ActiveSetId = null;
-            _state.ActiveSnapshotId = null;
-            _state.PendingSnapshotId = null;
-            _state.StartedAtUtc = null;
-            _state.StartedBy = null;
-            ClearActiveWeeklyMapTracking();
-            _nextAutosaveAt = null;
-            _originalSlots.Clear();
-            _store.SaveState(_state);
+            DeactivateWeeklyMode();
             message = "Weekly mode cancelled. Future rounds will use normal map selection.";
+            _sawmill.Info(message);
+            return true;
+        }
+        finally
+        {
+            _operationInProgress = false;
+        }
+    }
+
+    public bool TryStop(string setId, out string message)
+    {
+        if (!WeeklyModeStore.IsSafeId(setId))
+        {
+            message = "Invalid setId. Use only ASCII letters, digits, '-', '_' or '.'.";
+            return false;
+        }
+
+        if (!TryEnterOperation(out message))
+            return false;
+
+        try
+        {
+            if (!_state.IsActive || _state.ActiveSetId == null)
+            {
+                message = "Weekly mode is not active.";
+                return false;
+            }
+
+            if (!string.Equals(_state.ActiveSetId, setId, StringComparison.Ordinal))
+            {
+                message = $"Weekly set '{setId}' is not active. Active set: '{_state.ActiveSetId}'.";
+                return false;
+            }
+
+            DeactivateWeeklyMode();
+            message = $"Weekly set '{setId}' stopped. Autosave and runtime role overrides were cleared; snapshots and campaign config were kept.";
             _sawmill.Info(message);
             return true;
         }
@@ -580,6 +707,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             $"activeMapEntity={mapEntity.Id}\n" +
             $"activeMapName={mapName}\n" +
             $"baseMapPrototype={set.BaseMapPrototype}\n" +
+            $"baseMapPath={set.BaseMapPath}\n" +
             $"grids={string.Join(",", gridUids.Select(uid => uid.Id))}\n" +
             $"entities={activeEntityCount}");
 
@@ -590,7 +718,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         _resource.UserData.Delete(tempDirectory);
         _resource.UserData.CreateDir(tempDirectory);
 
-        var excludedRoots = CollectSnapshotExcludedRoots();
+        var excludedRoots = CollectSnapshotExcludedRoots(set);
         if (!TrySaveMapExcludingPlayers(mapId, stationPath, excludedRoots, out var yamlUidMap))
         {
             _resource.UserData.Delete(tempDirectory);
@@ -613,6 +741,7 @@ public sealed class WeeklyModeSystem : EntitySystem
                 $"removedSuitSensorEntityReferences={sanitization.RemovedSuitSensorEntityReferences}\n" +
                 $"removedInvalidContainerReferences={sanitization.RemovedInvalidContainerReferences}\n" +
                 $"resetMapInitializationFields={sanitization.ResetMapInitializationFields}\n" +
+                $"resetMindContainers={sanitization.ResetMindContainers}\n" +
                 $"suppressedMapInitOnlyComponents={sanitization.SuppressedMapInitOnlyComponents}\n" +
                 $"suppressedStartingItems={sanitization.SuppressedStartingItems}");
         }
@@ -622,6 +751,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         {
             DisabledJobs = set.DefaultDisabledJobs.ToList(),
             RoleAliases = new Dictionary<string, string>(set.DefaultRoleAliases),
+            RoleLimits = new Dictionary<string, int>(set.DefaultRoleLimits),
         };
 
         var metadata = new WeeklySnapshotMetadata
@@ -630,6 +760,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             SetId = set.SetId,
             Kind = kind,
             BaseMapPrototype = set.BaseMapPrototype,
+            BaseMapPath = set.BaseMapPath,
             CreatedAtUtc = DateTime.UtcNow,
             ContentVersion = _cfg.GetCVar(Robust.Shared.CVars.BuildVersion),
             EngineVersion = _cfg.GetCVar(Robust.Shared.CVars.BuildEngineVersion),
@@ -684,7 +815,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     public bool TryDisableRoles(string setId, IReadOnlyList<string> jobIds, out string message)
     {
-        if (!TryLoadMutableSet(setId, out var set, out message))
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
             return false;
 
         if (jobIds.Count is < 1 or > 10)
@@ -715,9 +846,6 @@ public sealed class WeeklyModeSystem : EntitySystem
         set.DefaultDisabledJobs.Sort(StringComparer.Ordinal);
         _store.SaveSet(set);
 
-        if (IsActiveSet(set.SetId))
-            ApplyRoleOverridesToStations(set);
-
         message = added.Count == 0
             ? $"No role changes were needed for set '{set.SetId}'."
             : $"Disabled roles for set '{set.SetId}': {string.Join(", ", added)}.";
@@ -726,7 +854,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     public bool TryEnableRoles(string setId, IReadOnlyList<string> jobIds, out string message)
     {
-        if (!TryLoadMutableSet(setId, out var set, out message))
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
             return false;
 
         var removed = new List<string>();
@@ -738,9 +866,6 @@ public sealed class WeeklyModeSystem : EntitySystem
 
         _store.SaveSet(set);
 
-        if (IsActiveSet(set.SetId))
-            RestoreRolesOnStations(removed);
-
         message = removed.Count == 0
             ? $"No role changes were needed for set '{set.SetId}'."
             : $"Enabled roles for set '{set.SetId}': {string.Join(", ", removed)}.";
@@ -749,7 +874,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     public bool TryRenameRole(string setId, string jobId, string alias, out string message)
     {
-        if (!TryLoadMutableSet(setId, out var set, out message))
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
             return false;
 
         if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
@@ -772,7 +897,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     public bool TryRenameRolesBatch(string setId, string batch, out string message)
     {
-        if (!TryLoadMutableSet(setId, out var set, out message))
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
             return false;
 
         var parsed = new List<(string JobId, string Alias)>();
@@ -833,7 +958,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     public bool TryClearRoleAliases(string setId, IReadOnlyList<string> jobIds, out string message)
     {
-        if (!TryLoadMutableSet(setId, out var set, out message))
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
             return false;
 
         if (jobIds.Count > 0)
@@ -873,19 +998,809 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     public bool TryClearRoles(string setId, out string message)
     {
-        if (!TryLoadMutableSet(setId, out var set, out message))
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
             return false;
 
-        var restored = set.DefaultDisabledJobs.ToList();
         set.DefaultDisabledJobs.Clear();
         set.DefaultRoleAliases.Clear();
+        set.DefaultRoleLimits.Clear();
         _store.SaveSet(set);
 
-        if (IsActiveSet(set.SetId))
-            RestoreRolesOnStations(restored);
-
-        message = $"Cleared disabled roles and aliases for set '{set.SetId}'.";
+        message = $"Cleared disabled roles, aliases, and limits for set '{set.SetId}'.";
         return true;
+    }
+
+    public bool TrySetRoleLimit(string setId, string jobId, int count, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+        {
+            message = $"Unknown job prototype '{jobId}'.";
+            return false;
+        }
+
+        if (count < 0)
+        {
+            message = "Role limit may not be negative.";
+            return false;
+        }
+
+        set.DefaultRoleLimits[jobId] = count;
+        _store.SaveSet(set);
+        message = $"Set role limit for '{jobId}' to {count} in weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public string ListRoleLimits(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        if (set.DefaultRoleLimits.Count == 0)
+            return $"Weekly set '{set.SetId}' has no role limits.";
+
+        var lines = new List<string> { $"Role limits for weekly set '{set.SetId}':" };
+        foreach (var (jobId, count) in set.DefaultRoleLimits.OrderBy(x => x.Key, StringComparer.Ordinal))
+            lines.Add($"- {jobId}: {count}");
+
+        return string.Join('\n', lines);
+    }
+
+    public bool TryClearRoleLimit(string setId, string jobId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+        {
+            message = $"Unknown job prototype '{jobId}'.";
+            return false;
+        }
+
+        if (!set.DefaultRoleLimits.Remove(jobId))
+        {
+            message = $"Weekly set '{set.SetId}' had no role limit for '{jobId}'.";
+            return true;
+        }
+
+        _store.SaveSet(set);
+        message = $"Cleared role limit for '{jobId}' in weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryClearRoleLimits(string setId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var removed = set.DefaultRoleLimits.Count;
+        set.DefaultRoleLimits.Clear();
+        _store.SaveSet(set);
+        message = removed == 0
+            ? $"Weekly set '{set.SetId}' had no role limits."
+            : $"Cleared {removed} role limits for weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TrySetAutosave(string setId, int intervalMinutes, int warningMinutes, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (intervalMinutes < 1)
+        {
+            message = "Autosave interval must be at least 1 minute.";
+            return false;
+        }
+
+        if (warningMinutes < 0)
+        {
+            message = "Autosave warning may not be negative.";
+            return false;
+        }
+
+        if (warningMinutes >= intervalMinutes)
+        {
+            message = "Autosave warning must be shorter than the autosave interval.";
+            return false;
+        }
+
+        set.AutosaveMinutes = intervalMinutes;
+        set.AutosaveWarningMinutes = warningMinutes;
+        _store.SaveSet(set);
+        message = $"Autosave for weekly set '{set.SetId}' set to every {intervalMinutes} minutes with {warningMinutes} minute warning.";
+        return true;
+    }
+
+    public bool TrySetPersistAutonomousMobs(string setId, bool enabled, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        set.PersistAutonomousMobs = enabled;
+        _store.SaveSet(set);
+        message = $"Autonomous mob persistence for weekly set '{set.SetId}' set to {enabled}.";
+        return true;
+    }
+
+    public bool TryExcludeMobPrototype(string setId, string prototypeId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!_prototype.TryIndex<EntityPrototype>(prototypeId, out _))
+        {
+            message = $"Unknown entity prototype '{prototypeId}'.";
+            return false;
+        }
+
+        if (!set.ExcludedMobPrototypes.Contains(prototypeId, StringComparer.Ordinal))
+            set.ExcludedMobPrototypes.Add(prototypeId);
+
+        set.ExcludedMobPrototypes.Sort(StringComparer.Ordinal);
+        _store.SaveSet(set);
+        message = $"Excluded mob prototype '{prototypeId}' from weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public string ListExcludedMobPrototypes(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        return set.ExcludedMobPrototypes.Count == 0
+            ? $"Weekly set '{set.SetId}' has no excluded mob prototypes."
+            : $"Excluded mob prototypes for weekly set '{set.SetId}':\n- {string.Join("\n- ", set.ExcludedMobPrototypes.OrderBy(x => x, StringComparer.Ordinal))}";
+    }
+
+    public bool TryClearExcludedMobPrototype(string setId, string prototypeId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!set.ExcludedMobPrototypes.Remove(prototypeId))
+        {
+            message = $"Weekly set '{set.SetId}' had no excluded mob prototype '{prototypeId}'.";
+            return true;
+        }
+
+        _store.SaveSet(set);
+        message = $"Removed excluded mob prototype '{prototypeId}' from weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TrySetMinPlaytime(string setId, int hours, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (hours < 0)
+        {
+            message = "Minimum playtime may not be negative.";
+            return false;
+        }
+
+        set.MinPlaytimeHours = hours;
+        _store.SaveSet(set);
+        message = $"Minimum server playtime for weekly set '{set.SetId}' set to {hours} hours.";
+        return true;
+    }
+
+    public bool TrySetDiscordChannel(string setId, string channel, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        channel = channel.Trim().Trim('"');
+        if (channel.Length > 128)
+        {
+            message = "Discord channel/link may not be longer than 128 characters.";
+            return false;
+        }
+
+        if (channel.Any(char.IsControl))
+        {
+            message = "Discord channel/link may not contain control characters.";
+            return false;
+        }
+
+        set.DiscordChannel = channel;
+        _store.SaveSet(set);
+        message = string.IsNullOrWhiteSpace(channel)
+            ? $"Discord channel cleared for weekly set '{set.SetId}'."
+            : $"Discord channel for weekly set '{set.SetId}' set to '{channel}'.";
+        return true;
+    }
+
+    public string GetAccessStatus(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var discord = string.IsNullOrWhiteSpace(set.DiscordChannel) ? "<none>" : set.DiscordChannel;
+        return $"Access for weekly set '{set.SetId}': minPlaytimeHours={set.MinPlaytimeHours}, discord={discord}.";
+    }
+
+    public bool TryClearAccess(string setId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        set.MinPlaytimeHours = 0;
+        set.DiscordChannel = string.Empty;
+        _store.SaveSet(set);
+        message = $"Cleared access restrictions for weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TrySetRandomGameRules(string setId, bool enabled, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        set.RandomGameRulesEnabled = enabled;
+        _store.SaveSet(set);
+        message = $"Random gamerules for weekly set '{set.SetId}' set to {enabled}.";
+        return true;
+    }
+
+    public string GetGameRulesStatus(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        return $"Gamerules for weekly set '{set.SetId}': randomGameRulesEnabled={set.RandomGameRulesEnabled}.";
+    }
+
+    public bool TryAddTechnology(
+        string setId,
+        string branch,
+        string technologyId,
+        int cost,
+        int tier,
+        IReadOnlyList<string> recipeIds,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+
+        if (!TryNormalizeTechnologyBranch(branch, out branch, out message))
+            return false;
+
+        technologyId = technologyId.Trim();
+        if (!WeeklyModeStore.IsSafeId(technologyId))
+        {
+            message = "technologyId must contain only ASCII letters, digits, '-', '_' or '.'.";
+            return false;
+        }
+
+        if (set.WeeklyTechnologies.Any(entry => string.Equals(entry.TechnologyId, technologyId, StringComparison.Ordinal)))
+        {
+            message = $"Technology '{technologyId}' already exists in weekly set '{set.SetId}'.";
+            return false;
+        }
+
+        if (cost < 0)
+        {
+            message = "Technology cost may not be negative.";
+            return false;
+        }
+
+        if (tier is < 1 or > 3)
+        {
+            message = "Technology tier must be 1, 2 or 3.";
+            return false;
+        }
+
+        var recipes = new List<string>();
+        foreach (var rawRecipe in recipeIds)
+        {
+            var recipeId = rawRecipe.Trim();
+            if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _))
+            {
+                message = $"Unknown lathe recipe prototype '{recipeId}'. No technology was changed.";
+                return false;
+            }
+
+            if (!recipes.Contains(recipeId, StringComparer.Ordinal))
+                recipes.Add(recipeId);
+        }
+
+        set.WeeklyTechnologies.Add(new WeeklyTechnologyEntry
+        {
+            TechnologyId = technologyId,
+            Branch = branch,
+            Cost = cost,
+            Tier = tier,
+            RecipeIds = recipes,
+        });
+
+        set.WeeklyTechnologies.Sort((a, b) => string.Compare(a.TechnologyId, b.TechnologyId, StringComparison.Ordinal));
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+            return false;
+
+        message = $"Added weekly technology '{technologyId}' to branch '{branch}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryUpdateTechnology(
+        string setId,
+        string technologyId,
+        string branch,
+        int cost,
+        int tier,
+        IReadOnlyList<string> recipeIds,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+
+        if (!TryNormalizeTechnologyBranch(branch, out branch, out message))
+            return false;
+
+        technologyId = technologyId.Trim();
+        var entry = set.WeeklyTechnologies.FirstOrDefault(entry =>
+            string.Equals(entry.TechnologyId, technologyId, StringComparison.Ordinal));
+        if (entry == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no technology '{technologyId}'.";
+            return false;
+        }
+
+        if (cost < 0)
+        {
+            message = "Technology cost may not be negative.";
+            return false;
+        }
+
+        if (tier is < 1 or > 3)
+        {
+            message = "Technology tier must be 1, 2 or 3.";
+            return false;
+        }
+
+        var recipes = new List<string>();
+        foreach (var rawRecipe in recipeIds)
+        {
+            var recipeId = rawRecipe.Trim();
+            if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _))
+            {
+                message = $"Unknown lathe recipe prototype '{recipeId}'. No technology was changed.";
+                return false;
+            }
+
+            if (!recipes.Contains(recipeId, StringComparer.Ordinal))
+                recipes.Add(recipeId);
+        }
+
+        if (HasPurchasedWeeklyTechnology(set.SetId, technologyId))
+        {
+            var removedRecipes = entry.RecipeIds
+                .Where(recipe => !recipes.Contains(recipe, StringComparer.Ordinal))
+                .ToList();
+            if (removedRecipes.Count > 0)
+            {
+                message = $"Weekly technology '{technologyId}' is already purchased. Refusing to remove unlocked recipes without an explicit remove --force. Removed recipes would be: {FormatList(removedRecipes)}.";
+                return false;
+            }
+        }
+
+        entry.Branch = branch;
+        entry.Cost = cost;
+        entry.Tier = tier;
+        entry.RecipeIds = recipes;
+        set.WeeklyTechnologies.Sort((a, b) => string.Compare(a.TechnologyId, b.TechnologyId, StringComparison.Ordinal));
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+            return false;
+
+        message = $"Updated weekly technology '{technologyId}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryRemoveTechnology(string setId, string branch, string technologyId, bool force, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+
+        if (!TryNormalizeTechnologyBranch(branch, out branch, out message))
+            return false;
+
+        if (!force && HasPurchasedWeeklyTechnology(set.SetId, technologyId))
+        {
+            message = $"Weekly technology '{technologyId}' is already purchased in the active campaign. Use '--force' to remove it and explicitly drop recipes that only come from that weekly technology.";
+            return false;
+        }
+
+        var removed = set.WeeklyTechnologies.RemoveAll(entry =>
+            string.Equals(entry.Branch, branch, StringComparison.Ordinal) &&
+            string.Equals(entry.TechnologyId, technologyId, StringComparison.Ordinal));
+
+        if (removed > 0 && !TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+            return false;
+
+        message = removed == 0
+            ? $"Weekly set '{set.SetId}' had no technology '{technologyId}' in branch '{branch}'."
+            : $"Removed technology '{technologyId}' from branch '{branch}' in weekly set '{set.SetId}'.";
+        return true;
+    }
+
+    public string ListTechnologies(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        if (set.WeeklyTechnologies.Count == 0)
+            return $"Weekly set '{set.SetId}' has an empty research tree.";
+
+        var lines = new List<string> { $"Weekly research tree for '{set.SetId}':" };
+        foreach (var entry in set.WeeklyTechnologies
+                     .OrderBy(x => x.Branch, StringComparer.Ordinal)
+                     .ThenBy(x => x.TechnologyId, StringComparer.Ordinal))
+        {
+            lines.Add($"- {entry.Branch}: {entry.TechnologyId} cost={entry.Cost} tier={entry.Tier} recipes=[{FormatList(entry.RecipeIds)}]");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    public bool TryClearTechnologies(string setId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+        var purchased = GetPurchasedWeeklyTechnologies(set.SetId);
+        var removedPurchased = set.WeeklyTechnologies
+            .Where(entry => purchased.Contains(entry.TechnologyId))
+            .Select(entry => entry.TechnologyId)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (removedPurchased.Count > 0)
+        {
+            message = $"Refusing to clear purchased weekly technologies from active set '{set.SetId}': {FormatList(removedPurchased)}.";
+            return false;
+        }
+
+        var removed = set.WeeklyTechnologies.Count;
+        set.WeeklyTechnologies.Clear();
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+            return false;
+
+        message = $"Cleared {removed} weekly technologies from set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryClearTechnologyBranch(string setId, string branch, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!TryNormalizeTechnologyBranch(branch, out branch, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+        var purchased = GetPurchasedWeeklyTechnologies(set.SetId);
+        var removedPurchased = set.WeeklyTechnologies
+            .Where(entry =>
+                string.Equals(entry.Branch, branch, StringComparison.Ordinal) &&
+                purchased.Contains(entry.TechnologyId))
+            .Select(entry => entry.TechnologyId)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (removedPurchased.Count > 0)
+        {
+            message = $"Refusing to clear purchased weekly technologies from branch '{branch}' in active set '{set.SetId}': {FormatList(removedPurchased)}.";
+            return false;
+        }
+
+        var removed = set.WeeklyTechnologies.RemoveAll(entry => string.Equals(entry.Branch, branch, StringComparison.Ordinal));
+
+        if (removed > 0 && !TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+            return false;
+
+        message = $"Cleared {removed} weekly technologies from branch '{branch}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public string ValidateTechnologies(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var errors = ValidateWeeklyTechnologies(set).ToList();
+        return errors.Count == 0
+            ? $"Weekly research tree for '{set.SetId}' is valid."
+            : $"Weekly research tree for '{set.SetId}' is invalid:\n- {string.Join("\n- ", errors)}";
+    }
+
+    public bool TryAddCargoProduct(
+        string setId,
+        string productId,
+        string category,
+        int cost,
+        bool boxed,
+        int amount,
+        string itemPrototype,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+
+        productId = productId.Trim();
+        if (!WeeklyModeStore.IsSafeId(productId))
+        {
+            message = "productId must contain only ASCII letters, digits, '-', '_' or '.'.";
+            return false;
+        }
+
+        if (set.WeeklyCargoProducts.Any(entry => string.Equals(entry.ProductId, productId, StringComparison.Ordinal)))
+        {
+            message = $"Cargo product '{productId}' already exists in weekly set '{set.SetId}'.";
+            return false;
+        }
+
+        category = category.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(category))
+        {
+            message = "Cargo category may not be empty.";
+            return false;
+        }
+
+        if (cost < 0)
+        {
+            message = "Cargo product cost may not be negative.";
+            return false;
+        }
+
+        if (amount < 1)
+        {
+            message = "Cargo product amount must be at least 1.";
+            return false;
+        }
+
+        itemPrototype = itemPrototype.Trim();
+        if (!_prototype.TryIndex<EntityPrototype>(itemPrototype, out _))
+        {
+            message = $"Unknown item entity prototype '{itemPrototype}'.";
+            return false;
+        }
+
+        if (boxed && amount > WeeklyCargoBoxedCapacity)
+        {
+            message = $"Boxed weekly cargo products may contain at most {WeeklyCargoBoxedCapacity} entities.";
+            return false;
+        }
+
+        set.WeeklyCargoProducts.Add(new WeeklyCargoProductEntry
+        {
+            ProductId = productId,
+            Category = category,
+            Cost = cost,
+            Boxed = boxed,
+            Amount = amount,
+            ItemPrototype = itemPrototype,
+        });
+
+        set.WeeklyCargoProducts.Sort((a, b) => string.Compare(a.ProductId, b.ProductId, StringComparison.Ordinal));
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Cargo, out message))
+            return false;
+
+        message = $"Added weekly cargo product '{productId}' to category '{category}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryUpdateCargoProduct(
+        string setId,
+        string productId,
+        string category,
+        int cost,
+        bool boxed,
+        int amount,
+        string itemPrototype,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+
+        productId = productId.Trim();
+        var entry = set.WeeklyCargoProducts.FirstOrDefault(entry =>
+            string.Equals(entry.ProductId, productId, StringComparison.Ordinal));
+        if (entry == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no cargo product '{productId}'.";
+            return false;
+        }
+
+        category = category.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(category))
+        {
+            message = "Cargo category may not be empty.";
+            return false;
+        }
+
+        if (cost < 0)
+        {
+            message = "Cargo product cost may not be negative.";
+            return false;
+        }
+
+        if (amount < 1)
+        {
+            message = "Cargo product amount must be at least 1.";
+            return false;
+        }
+
+        itemPrototype = itemPrototype.Trim();
+        if (!_prototype.TryIndex<EntityPrototype>(itemPrototype, out _))
+        {
+            message = $"Unknown item entity prototype '{itemPrototype}'.";
+            return false;
+        }
+
+        if (boxed && amount > WeeklyCargoBoxedCapacity)
+        {
+            message = $"Boxed weekly cargo products may contain at most {WeeklyCargoBoxedCapacity} entities.";
+            return false;
+        }
+
+        entry.Category = category;
+        entry.Cost = cost;
+        entry.Boxed = boxed;
+        entry.Amount = amount;
+        entry.ItemPrototype = itemPrototype;
+        set.WeeklyCargoProducts.Sort((a, b) => string.Compare(a.ProductId, b.ProductId, StringComparison.Ordinal));
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Cargo, out message))
+            return false;
+
+        message = $"Updated weekly cargo product '{productId}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryRemoveCargoProduct(string setId, string productId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+
+        var removed = set.WeeklyCargoProducts.RemoveAll(entry => string.Equals(entry.ProductId, productId, StringComparison.Ordinal));
+
+        if (removed > 0 && !TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Cargo, out message))
+            return false;
+
+        message = removed == 0
+            ? $"Weekly set '{set.SetId}' had no cargo product '{productId}'."
+            : $"Removed weekly cargo product '{productId}' from set '{set.SetId}'.";
+        return true;
+    }
+
+    public string ListCargoProducts(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        if (set.WeeklyCargoProducts.Count == 0)
+            return $"Weekly set '{set.SetId}' has an empty cargo catalog.";
+
+        var lines = new List<string> { $"Weekly cargo catalog for '{set.SetId}':" };
+        foreach (var entry in set.WeeklyCargoProducts
+                     .OrderBy(x => x.Category, StringComparer.Ordinal)
+                     .ThenBy(x => x.ProductId, StringComparer.Ordinal))
+        {
+            lines.Add($"- {entry.Category}: {entry.ProductId} cost={entry.Cost} boxed={entry.Boxed} amount={entry.Amount} item={entry.ItemPrototype}");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    public bool TryClearCargoProducts(string setId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+        var removed = set.WeeklyCargoProducts.Count;
+        set.WeeklyCargoProducts.Clear();
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Cargo, out message))
+            return false;
+
+        message = $"Cleared {removed} weekly cargo products from set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryClearCargoCategory(string setId, string category, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+        category = category.Trim().Trim('"');
+        var removed = set.WeeklyCargoProducts.RemoveAll(entry => string.Equals(entry.Category, category, StringComparison.Ordinal));
+
+        if (removed > 0 && !TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Cargo, out message))
+            return false;
+
+        message = $"Cleared {removed} weekly cargo products from category '{category}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public string ValidateCargoProducts(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var errors = ValidateWeeklyCargoProducts(set).ToList();
+        return errors.Count == 0
+            ? $"Weekly cargo catalog for '{set.SetId}' is valid."
+            : $"Weekly cargo catalog for '{set.SetId}' is invalid:\n- {string.Join("\n- ", errors)}";
+    }
+
+    public string ShowConfig(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var lines = new List<string>
+        {
+            $"Weekly config for '{set.SetId}':",
+            $"- schemaVersion: {set.SchemaVersion}",
+            $"- displayName: {set.DisplayName}",
+            $"- baseMapPrototype: {set.BaseMapPrototype}",
+            $"- baseMapPath: {set.BaseMapPath}",
+            $"- currentSnapshot: {set.CurrentSnapshot ?? "<base>"}",
+            $"- autosave: interval={set.AutosaveMinutes}m warning={set.AutosaveWarningMinutes}m retain={set.RetainAutosaves}",
+            $"- disabledRoles: {FormatList(set.DefaultDisabledJobs)}",
+            $"- roleAliases: {FormatDictionary(set.DefaultRoleAliases)}",
+            $"- roleLimits: {FormatDictionary(set.DefaultRoleLimits)}",
+            $"- persistAutonomousMobs: {set.PersistAutonomousMobs}",
+            $"- persistPlayerControlledBorgs: {set.PersistPlayerControlledBorgs}",
+            $"- excludedMobPrototypes: {FormatList(set.ExcludedMobPrototypes)}",
+            $"- access: minPlaytimeHours={set.MinPlaytimeHours} discord={(string.IsNullOrWhiteSpace(set.DiscordChannel) ? "<none>" : set.DiscordChannel)}",
+            $"- randomGameRulesEnabled: {set.RandomGameRulesEnabled}",
+            $"- researchTree: {set.WeeklyTechnologies.Count} entries",
+            $"- cargoCatalog: {set.WeeklyCargoProducts.Count} entries",
+            $"- snapshots: {set.Snapshots.Count}",
+            $"- active: {IsActiveSet(set.SetId)}",
+        };
+
+        return string.Join('\n', lines);
+    }
+
+    public string ValidateConfig(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        if (TryValidateSetConfig(set, out var errors))
+            return $"Weekly set '{set.SetId}' config is valid.";
+
+        return $"Weekly set '{set.SetId}' config is invalid:\n- {string.Join("\n- ", errors)}";
+    }
+
+    public string ExportConfig(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        return _store.ExportSetJson(set);
     }
 
     public bool TryGetRoleAlias(string jobId, [NotNullWhen(true)] out string? alias)
@@ -931,6 +1846,171 @@ public sealed class WeeklyModeSystem : EntitySystem
         return aliases;
     }
 
+    public bool ShouldSuppressAutomaticGameRules()
+    {
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return false;
+
+        return _store.TryLoadSet(_state.ActiveSetId, out var set) && !set.RandomGameRulesEnabled;
+    }
+
+    public bool TryGetActiveWeeklyCargoProducts(out List<WeeklyCargoProductData> products)
+    {
+        products = new List<WeeklyCargoProductData>();
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return false;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
+            return false;
+
+        foreach (var entry in set.WeeklyCargoProducts)
+        {
+            if (TryBuildWeeklyCargoProductData(entry, out var product))
+                products.Add(product);
+        }
+
+        products.Sort((a, b) => string.Compare(a.ProductId, b.ProductId, StringComparison.Ordinal));
+
+        return true;
+    }
+
+    public bool TryGetActiveWeeklyCargoProduct(string productId, out WeeklyCargoProductData product)
+    {
+        product = default;
+        if (!TryGetActiveWeeklyCargoProducts(out var products))
+            return false;
+
+        foreach (var candidate in products)
+        {
+            if (!string.Equals(candidate.ProductId, productId, StringComparison.Ordinal))
+                continue;
+
+            product = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool TryGetActiveWeeklyCargoProductIds(out HashSet<string> productIds)
+    {
+        productIds = new HashSet<string>(StringComparer.Ordinal);
+        if (!TryGetActiveWeeklyCargoProducts(out var products))
+            return false;
+
+        foreach (var entry in products)
+            productIds.Add(entry.ProductId);
+
+        return true;
+    }
+
+    private bool TryBuildWeeklyCargoProductData(WeeklyCargoProductEntry entry, out WeeklyCargoProductData product)
+    {
+        product = default;
+        if (!_prototype.TryIndex<EntityPrototype>(entry.ItemPrototype, out var itemPrototype))
+            return false;
+
+        product = new WeeklyCargoProductData
+        {
+            ProductId = entry.ProductId,
+            Name = itemPrototype.Name,
+            Description = itemPrototype.Description,
+            Category = entry.Category,
+            Cost = entry.Cost,
+            Boxed = entry.Boxed,
+            Amount = entry.Amount,
+            ItemPrototype = entry.ItemPrototype,
+            Icon = new SpriteSpecifier.EntityPrototype(entry.ItemPrototype),
+        };
+
+        return true;
+    }
+
+    public bool IsWeeklyAccessAllowed(ICommonSession session, bool notify)
+    {
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return true;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
+            return true;
+
+        return IsWeeklyAccessAllowed(session, set, notify);
+    }
+
+    private bool IsWeeklyAccessAllowed(ICommonSession session, WeeklyModeSet set, bool notify)
+    {
+        if (set.MinPlaytimeHours <= 0)
+            return true;
+
+        var required = TimeSpan.FromHours(set.MinPlaytimeHours);
+        var current = GetOverallPlaytimeOrZero(session);
+        if (current >= required)
+            return true;
+
+        if (notify)
+            SendAccessDeniedNotice(session, set, false);
+
+        return false;
+    }
+
+    private TimeSpan GetOverallPlaytimeOrZero(ICommonSession session)
+    {
+        return _playTime.TryGetTrackerTimes(session, out var times) &&
+               times.TryGetValue(PlayTimeTrackingShared.TrackerOverall, out var overall)
+            ? overall
+            : TimeSpan.Zero;
+    }
+
+    private void OnPlayerJoinedLobby(PlayerJoinedLobbyEvent ev)
+    {
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set) || set.MinPlaytimeHours <= 0)
+            return;
+
+        if (IsWeeklyAccessAllowed(ev.PlayerSession, set, false))
+            return;
+
+        if (_accessLobbyNoticeSent.Add(ev.PlayerSession.UserId))
+            SendAccessDeniedNotice(ev.PlayerSession, set, true);
+    }
+
+    private void OnStationJobsGetCandidates(ref StationJobsGetCandidatesEvent ev)
+    {
+        if (!_playerManager.TryGetSessionById(ev.Player, out var session))
+            return;
+
+        if (!IsWeeklyAccessAllowed(session, true))
+            ev.Jobs.Clear();
+    }
+
+    private void OnIsRoleAllowed(ref IsRoleAllowedEvent ev)
+    {
+        if (IsWeeklyAccessAllowed(ev.Player, true))
+            return;
+
+        ev.Cancelled = true;
+    }
+
+    private void OnGetDisallowedJobs(ref GetDisallowedJobsEvent ev)
+    {
+        if (IsWeeklyAccessAllowed(ev.Player, false))
+            return;
+
+        foreach (var job in _prototype.EnumeratePrototypes<JobPrototype>())
+            ev.Jobs.Add(job.ID);
+
+        SendAccessDeniedNotice(ev.Player, LoadActiveSetOrNull(), false);
+    }
+
+    private WeeklyModeSet? LoadActiveSetOrNull()
+    {
+        return _state.ActiveSetId != null && _store.TryLoadSet(_state.ActiveSetId, out var set)
+            ? set
+            : null;
+    }
+
     private void OnLoadingMaps(LoadingMapsEvent ev)
     {
         if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
@@ -964,7 +2044,11 @@ public sealed class WeeklyModeSystem : EntitySystem
         }
         else
         {
-            _gameMapManager.SelectMap(set.BaseMapPrototype);
+            if (TryGetConfiguredBaseMapPath(set, out var baseMapPath))
+                _gameMapManager.SelectMapPath(set.BaseMapPrototype, baseMapPath);
+            else
+                _gameMapManager.SelectMap(set.BaseMapPrototype);
+
             _state.ActiveSnapshotId = null;
             _state.PendingSnapshotId = null;
             _store.SaveState(_state);
@@ -972,6 +2056,7 @@ public sealed class WeeklyModeSystem : EntitySystem
                 "Weekly first start:\n" +
                 $"set={set.SetId}\n" +
                 $"baseMapPrototype={set.BaseMapPrototype}\n" +
+                $"baseMapPath={set.BaseMapPath}\n" +
                 "source=BaseMap\n" +
                 $"previousMap={previousMap}");
         }
@@ -1014,6 +2099,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             return;
 
         var (mapEntity, gridUids) = TrackActiveWeeklyMap(set, ev);
+        ApplyWeeklyResearchOverlay(set);
 
         if (_state.ActiveSnapshotId == null)
             return;
@@ -1028,6 +2114,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         }
 
         ApplyContainerPatch(ev.Map, mapEntity, gridUids, patch, _state.ActiveSetId, _state.ActiveSnapshotId);
+        DeactivateLoadedSnapshotBorgs(mapEntity, gridUids);
     }
 
     private void OnStationInitialized(StationInitializedEvent ev)
@@ -1039,6 +2126,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             return;
 
         ApplyRoleOverridesToStation(ev.Station, set);
+        ApplyWeeklyResearchOverlay(set);
     }
 
     private void OnRoundStarted(RoundStartedEvent ev)
@@ -1046,16 +2134,19 @@ public sealed class WeeklyModeSystem : EntitySystem
         if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
         {
             _nextAutosaveAt = null;
+            _autosaveWarningIssued = false;
             return;
         }
 
         if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
         {
             _nextAutosaveAt = null;
+            _autosaveWarningIssued = false;
             return;
         }
 
         _nextAutosaveAt = _timing.CurTime + TimeSpan.FromMinutes(Math.Max(1, set.AutosaveMinutes));
+        _autosaveWarningIssued = false;
     }
 
     private (EntityUid MapEntity, List<EntityUid> GridUids) TrackActiveWeeklyMap(WeeklyModeSet set, PostGameMapLoad ev)
@@ -1225,6 +2316,17 @@ public sealed class WeeklyModeSystem : EntitySystem
                 "Snapshot map mismatch:\n" +
                 $"set base map: {set.BaseMapPrototype}\n" +
                 $"snapshot map: {metadata.BaseMapPrototype}";
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(metadata.BaseMapPath) &&
+            !string.IsNullOrWhiteSpace(set.BaseMapPath) &&
+            !string.Equals(metadata.BaseMapPath, set.BaseMapPath, StringComparison.Ordinal))
+        {
+            message =
+                "Snapshot map path mismatch:\n" +
+                $"set base map path: {set.BaseMapPath}\n" +
+                $"snapshot map path: {metadata.BaseMapPath}";
             return false;
         }
 
@@ -1650,6 +2752,31 @@ public sealed class WeeklyModeSystem : EntitySystem
         _sawmill.Info($"Applied weekly container patch for set '{setId}' snapshot '{snapshotId}': restored={restored}, skipped={skipped}, entries={patch.Entries.Count}.");
     }
 
+    private void DeactivateLoadedSnapshotBorgs(EntityUid mapEntity, IReadOnlyCollection<EntityUid> gridUids)
+    {
+        var weeklyEntities = CollectWeeklyMapEntities(mapEntity, gridUids);
+        var deactivated = 0;
+        foreach (var uid in weeklyEntities)
+        {
+            if (!TryComp<BorgChassisComponent>(uid, out var borg))
+                continue;
+
+            if (borg.Active)
+                _borg.SetActive((uid, borg), false);
+
+            if (TryComp<MindContainerComponent>(uid, out var mindContainer) &&
+                mindContainer.Mind != null)
+            {
+                _mind.TransferTo(mindContainer.Mind.Value, null, createGhost: false);
+            }
+
+            deactivated++;
+        }
+
+        if (deactivated > 0)
+            _sawmill.Info($"Deactivated {deactivated} borg chassis after Weekly snapshot load.");
+    }
+
     private Dictionary<int, EntityUid> BuildYamlEntityMap(
         MapId mapId,
         EntityUid mapEntity,
@@ -1708,6 +2835,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     private void ApplyRoleOverridesToStation(EntityUid station, WeeklyModeSet set)
     {
+        var disabledJobs = set.DefaultDisabledJobs.ToHashSet(StringComparer.Ordinal);
         foreach (var jobId in set.DefaultDisabledJobs)
         {
             if (!_stationJobs.TryGetJobSlot(station, jobId, out var current))
@@ -1716,6 +2844,19 @@ public sealed class WeeklyModeSystem : EntitySystem
             var stationSlots = _originalSlots.GetOrNew(station);
             stationSlots.TryAdd(jobId, current);
             _stationJobs.TrySetJobSlot(station, jobId, 0);
+        }
+
+        foreach (var (jobId, limit) in set.DefaultRoleLimits.OrderBy(x => x.Key, StringComparer.Ordinal))
+        {
+            if (disabledJobs.Contains(jobId) || limit < 0)
+                continue;
+
+            if (!_stationJobs.TryGetJobSlot(station, jobId, out var current))
+                continue;
+
+            var stationSlots = _originalSlots.GetOrNew(station);
+            stationSlots.TryAdd(jobId, current);
+            _stationJobs.TrySetJobSlot(station, jobId, limit);
         }
     }
 
@@ -1744,17 +2885,109 @@ public sealed class WeeklyModeSystem : EntitySystem
         }
     }
 
-    private HashSet<EntityUid> CollectSnapshotExcludedRoots()
+    private void RestoreAllRolesOnStations()
     {
-        var excluded = _playerManager.Sessions
-            .Select(session => session.AttachedEntity)
-            .Where(entity => entity is { Valid: true })
-            .Select(entity => entity!.Value)
-            .ToHashSet();
+        foreach (var (station, slots) in _originalSlots.ToArray())
+        {
+            foreach (var (jobId, original) in slots.ToArray())
+            {
+                if (original == null)
+                    _stationJobs.MakeJobUnlimited(station, jobId);
+                else
+                    _stationJobs.TrySetJobSlot(station, jobId, original.Value, true);
+            }
+        }
+
+        _originalSlots.Clear();
+    }
+
+    private void ApplyWeeklyResearchOverlay(WeeklyModeSet set)
+    {
+        var technologies = BuildWeeklyResearchData(set);
+
+        var query = EntityQueryEnumerator<TechnologyDatabaseComponent>();
+        while (query.MoveNext(out var uid, out var database))
+            _research.SetWeeklyModeOverlay(uid, true, technologies, true, database);
+    }
+
+    private void RestoreWeeklyResearchOverlay()
+    {
+        var query = EntityQueryEnumerator<TechnologyDatabaseComponent>();
+        while (query.MoveNext(out var uid, out var database))
+        {
+            if (!database.WeeklyModeOnly &&
+                database.WeeklyAllowedTechnologies.Count == 0 &&
+                database.WeeklyTechnologies.Count == 0 &&
+                database.WeeklyUnlockedTechnologies.Count == 0)
+            {
+                continue;
+            }
+
+            _research.SetWeeklyModeOverlay(uid, false, Array.Empty<WeeklyTechnologyData>(), false, database);
+        }
+    }
+
+    private List<WeeklyTechnologyData> BuildWeeklyResearchData(WeeklyModeSet set)
+    {
+        var technologies = new List<WeeklyTechnologyData>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var entry in set.WeeklyTechnologies)
+        {
+            if (!seen.Add(entry.TechnologyId))
+                continue;
+
+            if (!TryNormalizeTechnologyBranch(entry.Branch, out var branch, out _) ||
+                !WeeklyTechnologyDisciplineIds.TryGetValue(branch, out var disciplineId) ||
+                !_prototype.TryIndex<TechDisciplinePrototype>(disciplineId, out var discipline))
+            {
+                continue;
+            }
+
+            var name = entry.TechnologyId;
+            var icon = discipline.Icon;
+            if (_prototype.TryIndex<TechnologyPrototype>(entry.TechnologyId, out var existingTechnology))
+            {
+                name = Loc.GetString(existingTechnology.Name);
+                icon = existingTechnology.Icon;
+            }
+
+            technologies.Add(new WeeklyTechnologyData
+            {
+                TechnologyId = entry.TechnologyId,
+                Name = name,
+                Branch = disciplineId,
+                Cost = entry.Cost,
+                Tier = entry.Tier,
+                RecipeIds = entry.RecipeIds.Distinct(StringComparer.Ordinal).ToList(),
+                Icon = icon,
+            });
+        }
+
+        technologies.Sort((a, b) => string.Compare(a.TechnologyId, b.TechnologyId, StringComparison.Ordinal));
+        return technologies;
+    }
+
+    private HashSet<EntityUid> CollectSnapshotExcludedRoots(WeeklyModeSet set)
+    {
+        var excluded = new HashSet<EntityUid>();
+        var excludedPrototypes = set.ExcludedMobPrototypes.ToHashSet(StringComparer.Ordinal);
+
+        foreach (var session in _playerManager.Sessions)
+        {
+            if (session.AttachedEntity is not { Valid: true } attached)
+                continue;
+
+            if (!ShouldPreservePlayerControlledEntity(attached, set))
+                excluded.Add(attached);
+        }
 
         var actors = EntityQueryEnumerator<ActorComponent>();
         while (actors.MoveNext(out var uid, out _))
-            excluded.Add(uid);
+        {
+            if (!ShouldPreservePlayerControlledEntity(uid, set))
+                excluded.Add(uid);
+        }
 
         var ghosts = EntityQueryEnumerator<GhostComponent>();
         while (ghosts.MoveNext(out var uid, out _))
@@ -1768,10 +3001,65 @@ public sealed class WeeklyModeSystem : EntitySystem
         while (mindContainers.MoveNext(out var uid, out var mindContainer))
         {
             if (mindContainer.HasMind || mindContainer.Mind != null)
+            {
+                if (!ShouldPreservePlayerControlledEntity(uid, set))
+                    excluded.Add(uid);
+            }
+        }
+
+        var mobs = EntityQueryEnumerator<MobStateComponent>();
+        while (mobs.MoveNext(out var uid, out _))
+        {
+            if (!set.PersistAutonomousMobs &&
+                !IsPlayerControlledEntity(uid) &&
+                !ShouldPreservePlayerControlledEntity(uid, set))
+            {
                 excluded.Add(uid);
+                continue;
+            }
+
+            var prototypeId = GetPrototypeId(uid);
+            if (!string.IsNullOrWhiteSpace(prototypeId) &&
+                IsPrototypeOrParentExcluded(prototypeId, excludedPrototypes))
+            {
+                excluded.Add(uid);
+            }
         }
 
         return excluded;
+    }
+
+    private bool ShouldPreservePlayerControlledEntity(EntityUid uid, WeeklyModeSet set)
+    {
+        return set.PersistPlayerControlledBorgs && HasComp<BorgChassisComponent>(uid);
+    }
+
+    private bool IsPlayerControlledEntity(EntityUid uid)
+    {
+        if (_actorQuery.HasComponent(uid))
+            return true;
+
+        if (_mindContainerQuery.TryGetComponent(uid, out var mindContainer) &&
+            (mindContainer.HasMind || mindContainer.Mind != null))
+        {
+            return true;
+        }
+
+        return _playerManager.Sessions.Any(session => session.AttachedEntity == uid);
+    }
+
+    private bool IsPrototypeOrParentExcluded(string prototypeId, IReadOnlySet<string> excludedPrototypes)
+    {
+        if (excludedPrototypes.Contains(prototypeId))
+            return true;
+
+        foreach (var (parentId, _) in _prototype.EnumerateAllParents<EntityPrototype>(prototypeId, true))
+        {
+            if (excludedPrototypes.Contains(parentId))
+                return true;
+        }
+
+        return false;
     }
 
     private WeeklyContainerPatch BuildContainerPatch(
@@ -1997,6 +3285,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         var removedSuitSensorReferences = 0;
         var removedInvalidContainerReferences = 0;
         var resetMapInitializationFields = 0;
+        var resetMindContainers = 0;
         var suppressedMapInitOnlyComponents = 0;
         var suppressedStartingItems = 0;
 
@@ -2007,6 +3296,7 @@ public sealed class WeeklyModeSystem : EntitySystem
                 removedSuitSensorReferences,
                 removedInvalidContainerReferences,
                 resetMapInitializationFields,
+                resetMindContainers,
                 suppressedMapInitOnlyComponents,
                 suppressedStartingItems);
         }
@@ -2063,6 +3353,13 @@ public sealed class WeeklyModeSystem : EntitySystem
                             components.RemoveAt(i);
                             removedStationMembers++;
                             break;
+                        case "Actor":
+                            components.RemoveAt(i);
+                            resetMindContainers++;
+                            break;
+                        case "MindContainer":
+                            resetMindContainers += ResetSerializedMindContainer(component);
+                            break;
                         case "SuitSensor":
                             if (component.Remove("station"))
                                 removedSuitSensorReferences++;
@@ -2118,8 +3415,26 @@ public sealed class WeeklyModeSystem : EntitySystem
             removedSuitSensorReferences,
             removedInvalidContainerReferences,
             resetMapInitializationFields,
+            resetMindContainers,
             suppressedMapInitOnlyComponents,
             suppressedStartingItems);
+    }
+
+    private static int ResetSerializedMindContainer(MappingDataNode component)
+    {
+        var changed = 0;
+        if (component.Remove("mind"))
+            changed++;
+
+        if (!component.TryGet<ValueDataNode>("hasMind", out var hasMind) ||
+            !bool.TryParse(hasMind.Value, out var value) ||
+            value)
+        {
+            component["hasMind"] = new ValueDataNode("false");
+            changed++;
+        }
+
+        return changed;
     }
 
     private static bool SuppressPoweredLightStartupLamp(MappingDataNode component)
@@ -2386,6 +3701,418 @@ public sealed class WeeklyModeSystem : EntitySystem
         return true;
     }
 
+    private bool TryLoadConfigEditableSet(string setId, [NotNullWhen(true)] out WeeklyModeSet? set, out string message)
+    {
+        return TryLoadMutableSet(setId, out set, out message);
+    }
+
+    private bool TryCommitConfigChange(WeeklyModeSet originalSet, WeeklyModeSet changedSet, WeeklyLiveConfigChange liveChange, out string message)
+    {
+        if (!TryValidateSetConfig(changedSet, out var errors))
+        {
+            message = $"Weekly set '{changedSet.SetId}' config is invalid:\n- {string.Join("\n- ", errors)}";
+            return false;
+        }
+
+        var active = IsActiveSet(changedSet.SetId);
+        var saved = false;
+        try
+        {
+            _store.SaveSet(changedSet);
+            saved = true;
+
+            if (active)
+                ApplyLiveConfigChange(changedSet, liveChange);
+
+            message = string.Empty;
+            return true;
+        }
+        catch (Exception e)
+        {
+            if (active && saved)
+            {
+                try
+                {
+                    _store.SaveSet(originalSet);
+                    ApplyLiveConfigChange(originalSet, liveChange);
+                }
+                catch (Exception rollbackException)
+                {
+                    _sawmill.Error($"Failed to roll back live weekly config change for set '{changedSet.SetId}': {rollbackException}");
+                }
+            }
+
+            message = $"Failed to apply weekly config change for set '{changedSet.SetId}': {e.Message}";
+            return false;
+        }
+    }
+
+    private void ApplyLiveConfigChange(WeeklyModeSet set, WeeklyLiveConfigChange liveChange)
+    {
+        if ((liveChange & WeeklyLiveConfigChange.Research) != 0)
+        {
+            ApplyWeeklyResearchOverlay(set);
+            _research.RefreshResearchConsoles();
+        }
+
+        if ((liveChange & WeeklyLiveConfigChange.Cargo) != 0)
+        {
+            RaiseLocalEvent(new WeeklyCargoCatalogChangedEvent());
+        }
+    }
+
+    private WeeklyModeSet CloneSet(WeeklyModeSet set)
+    {
+        return JsonSerializer.Deserialize<WeeklyModeSet>(_store.ExportSetJson(set))
+               ?? throw new InvalidOperationException($"Failed to clone weekly set '{set.SetId}'.");
+    }
+
+    private bool HasPurchasedWeeklyTechnology(string setId, string technologyId)
+    {
+        return GetPurchasedWeeklyTechnologies(setId).Contains(technologyId);
+    }
+
+    private HashSet<string> GetPurchasedWeeklyTechnologies(string setId)
+    {
+        var purchased = new HashSet<string>(StringComparer.Ordinal);
+        if (!IsActiveSet(setId))
+            return purchased;
+
+        var query = EntityQueryEnumerator<TechnologyDatabaseComponent>();
+        while (query.MoveNext(out _, out var database))
+        {
+            if (!database.WeeklyModeOnly)
+                continue;
+
+            foreach (var technologyId in database.WeeklyUnlockedTechnologies)
+                purchased.Add(technologyId);
+        }
+
+        return purchased;
+    }
+
+    private bool TryValidateSetConfig(WeeklyModeSet set, out List<string> errors)
+    {
+        errors = new List<string>();
+
+        if (set.SchemaVersion != WeeklyModeSet.CurrentSchemaVersion)
+            errors.Add($"schemaVersion {set.SchemaVersion} is not compatible with {WeeklyModeSet.CurrentSchemaVersion}");
+
+        if (!WeeklyModeStore.IsSafeId(set.SetId))
+            errors.Add("setId is not a safe weekly mode id");
+
+        if (string.IsNullOrWhiteSpace(set.BaseMapPrototype))
+            errors.Add("baseMapPrototype is empty");
+        else if (!_prototype.TryIndex<GameMapPrototype>(set.BaseMapPrototype, out _))
+            errors.Add($"unknown base map prototype '{set.BaseMapPrototype}'");
+
+        if (!string.IsNullOrWhiteSpace(set.BaseMapPath))
+        {
+            if (!TryResolveBaseMapPath(set.BaseMapPath, out var resolvedMap, out _, out var mapError))
+            {
+                errors.Add(mapError);
+            }
+            else if (!string.Equals(resolvedMap.ID, set.BaseMapPrototype, StringComparison.Ordinal))
+            {
+                errors.Add($"baseMapPath '{set.BaseMapPath}' resolves to map prototype '{resolvedMap.ID}', not configured prototype '{set.BaseMapPrototype}'");
+            }
+        }
+
+        if (set.AutosaveMinutes < 1)
+            errors.Add("autosave interval must be at least 1 minute");
+
+        if (set.AutosaveWarningMinutes < 0)
+            errors.Add("autosave warning may not be negative");
+
+        if (set.AutosaveWarningMinutes >= set.AutosaveMinutes)
+            errors.Add("autosave warning must be shorter than the autosave interval");
+
+        if (set.RetainAutosaves < 1)
+            errors.Add("autosave retention must be at least 1");
+
+        foreach (var jobId in set.DefaultDisabledJobs.Distinct(StringComparer.Ordinal))
+        {
+            if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+                errors.Add($"unknown disabled job prototype '{jobId}'");
+        }
+
+        foreach (var (jobId, alias) in set.DefaultRoleAliases)
+        {
+            if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+                errors.Add($"unknown aliased job prototype '{jobId}'");
+
+            if (!TryNormalizeAlias(alias, out _, out var aliasError))
+                errors.Add($"invalid alias for '{jobId}': {aliasError}");
+        }
+
+        foreach (var (jobId, limit) in set.DefaultRoleLimits)
+        {
+            if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+                errors.Add($"unknown limited job prototype '{jobId}'");
+
+            if (limit < 0)
+                errors.Add($"role limit for '{jobId}' may not be negative");
+        }
+
+        foreach (var prototypeId in set.ExcludedMobPrototypes.Distinct(StringComparer.Ordinal))
+        {
+            if (!_prototype.TryIndex<EntityPrototype>(prototypeId, out _))
+                errors.Add($"unknown excluded mob prototype '{prototypeId}'");
+        }
+
+        if (set.MinPlaytimeHours < 0)
+            errors.Add("minimum playtime may not be negative");
+
+        if (set.DiscordChannel.Any(char.IsControl))
+            errors.Add("discord channel/link may not contain control characters");
+
+        errors.AddRange(ValidateWeeklyTechnologies(set));
+        errors.AddRange(ValidateWeeklyCargoProducts(set));
+
+        return errors.Count == 0;
+    }
+
+    private void DeactivateWeeklyMode()
+    {
+        RestoreAllRolesOnStations();
+        _state.IsActive = false;
+        _state.ActiveSetId = null;
+        _state.ActiveSnapshotId = null;
+        _state.PendingSnapshotId = null;
+        _state.StartedAtUtc = null;
+        _state.StartedBy = null;
+        ClearActiveWeeklyMapTracking();
+        _nextAutosaveAt = null;
+        _autosaveWarningIssued = false;
+        _accessLobbyNoticeSent.Clear();
+        _accessNoticeCooldowns.Clear();
+        RestoreWeeklyResearchOverlay();
+        _gameMapManager.ClearSelectedMap();
+        _store.SaveState(_state);
+    }
+
+    private bool TryResolveBaseMapPath(
+        string rawPath,
+        [NotNullWhen(true)] out GameMapPrototype? baseMap,
+        out ResPath mapPath,
+        out string message)
+    {
+        baseMap = null;
+        mapPath = default;
+
+        if (!TryNormalizeContentMapPath(rawPath, out mapPath, out message))
+            return false;
+
+        if (!_resource.ContentFileExists(mapPath))
+        {
+            message = $"Map file '{mapPath}' does not exist in server resources.";
+            return false;
+        }
+
+        var resolvedPath = mapPath;
+        baseMap = _prototype.EnumeratePrototypes<GameMapPrototype>()
+            .FirstOrDefault(map => string.Equals(map.MapPath.CanonPath, resolvedPath.CanonPath, StringComparison.Ordinal));
+
+        if (baseMap == null)
+        {
+            message = $"Map file '{mapPath}' exists, but no GameMapPrototype references it. Add a map prototype for this file before creating a Weekly set.";
+            return false;
+        }
+
+        message = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeContentMapPath(string rawPath, out ResPath path, out string message)
+    {
+        path = default;
+        rawPath = rawPath.Trim().Trim('"').Replace('\\', '/');
+
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            message = "Map path may not be empty.";
+            return false;
+        }
+
+        if (rawPath.Contains(':') || rawPath.StartsWith("//", StringComparison.Ordinal))
+        {
+            message = "Map path must be a resource path, not an operating-system absolute path.";
+            return false;
+        }
+
+        if (!rawPath.StartsWith("/", StringComparison.Ordinal))
+        {
+            message = "Map path must start with '/', for example /Maps/saltern.yml.";
+            return false;
+        }
+
+        if (!ResPath.IsValidPath(rawPath))
+        {
+            message = "Map path contains invalid separators.";
+            return false;
+        }
+
+        path = new ResPath(rawPath).ToRootedPath();
+        if (ContainsTraversal(path))
+        {
+            message = "Map path may not contain '..'.";
+            return false;
+        }
+
+        if (!string.Equals(path.Extension, "yml", StringComparison.OrdinalIgnoreCase))
+        {
+            message = "Map path must point to a .yml file.";
+            return false;
+        }
+
+        message = string.Empty;
+        return true;
+    }
+
+    private static bool TryGetConfiguredBaseMapPath(WeeklyModeSet set, out ResPath mapPath)
+    {
+        mapPath = default;
+        if (string.IsNullOrWhiteSpace(set.BaseMapPath))
+            return false;
+
+        if (!TryNormalizeContentMapPath(set.BaseMapPath, out var resolved, out _))
+            return false;
+
+        mapPath = resolved;
+        return true;
+    }
+
+    private static bool ContainsTraversal(ResPath path)
+    {
+        foreach (var segment in path.CanonPath.Split(ResPath.SeparatorStr, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == "..")
+                return true;
+        }
+
+        return false;
+    }
+
+    private IEnumerable<string> ValidateWeeklyTechnologies(WeeklyModeSet set)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in set.WeeklyTechnologies)
+        {
+            if (!TryNormalizeTechnologyBranch(entry.Branch, out var normalizedBranch, out var branchError))
+            {
+                yield return $"technology '{entry.TechnologyId}' has invalid branch: {branchError}";
+            }
+            else if (!WeeklyTechnologyDisciplineIds.TryGetValue(normalizedBranch, out var disciplineId) ||
+                     !_prototype.TryIndex<TechDisciplinePrototype>(disciplineId, out _))
+            {
+                yield return $"technology '{entry.TechnologyId}' branch '{entry.Branch}' has no matching research discipline";
+            }
+
+            if (!WeeklyModeStore.IsSafeId(entry.TechnologyId))
+                yield return $"technologyId '{entry.TechnologyId}' is not a safe id";
+
+            if (!seen.Add(entry.TechnologyId))
+                yield return $"duplicate weekly technology '{entry.TechnologyId}'";
+
+            if (entry.Cost < 0)
+                yield return $"technology '{entry.TechnologyId}' cost may not be negative";
+
+            if (entry.Tier is < 1 or > 3)
+                yield return $"technology '{entry.TechnologyId}' tier must be 1, 2 or 3";
+
+            foreach (var recipeId in entry.RecipeIds.Distinct(StringComparer.Ordinal))
+            {
+                if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _))
+                    yield return $"technology '{entry.TechnologyId}' references unknown recipe '{recipeId}'";
+            }
+        }
+    }
+
+    private IEnumerable<string> ValidateWeeklyCargoProducts(WeeklyModeSet set)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in set.WeeklyCargoProducts)
+        {
+            if (!WeeklyModeStore.IsSafeId(entry.ProductId))
+                yield return $"cargo productId '{entry.ProductId}' is not a safe id";
+
+            if (!seen.Add(entry.ProductId))
+                yield return $"duplicate weekly cargo product '{entry.ProductId}'";
+
+            if (string.IsNullOrWhiteSpace(entry.Category))
+                yield return $"cargo product '{entry.ProductId}' category may not be empty";
+
+            if (entry.Cost < 0)
+                yield return $"cargo product '{entry.ProductId}' cost may not be negative";
+
+            if (entry.Amount < 1)
+                yield return $"cargo product '{entry.ProductId}' amount must be at least 1";
+
+            if (!_prototype.TryIndex<EntityPrototype>(entry.ItemPrototype, out _))
+                yield return $"cargo product '{entry.ProductId}' references unknown item prototype '{entry.ItemPrototype}'";
+
+            if (entry.Boxed && entry.Amount > WeeklyCargoBoxedCapacity)
+                yield return $"cargo product '{entry.ProductId}' boxed amount exceeds default crate capacity ({WeeklyCargoBoxedCapacity})";
+        }
+    }
+
+    private static string DescribeBaseMap(WeeklyModeSet set)
+    {
+        return string.IsNullOrWhiteSpace(set.BaseMapPath)
+            ? set.BaseMapPrototype
+            : $"{set.BaseMapPath} ({set.BaseMapPrototype})";
+    }
+
+    private void SendAutosaveOoc(string message)
+    {
+        _chatManager.ChatMessageToAll(ChatChannel.OOC, message, message, EntityUid.Invalid, false, true);
+    }
+
+    private void SendAccessDeniedNotice(ICommonSession session, WeeklyModeSet? set, bool force)
+    {
+        if (set == null || set.MinPlaytimeHours <= 0)
+            return;
+
+        if (!force &&
+            _accessNoticeCooldowns.TryGetValue(session.UserId, out var nextAllowed) &&
+            _timing.CurTime < nextAllowed)
+        {
+            return;
+        }
+
+        _accessNoticeCooldowns[session.UserId] = _timing.CurTime + TimeSpan.FromSeconds(30);
+        _chatManager.DispatchServerMessage(session, BuildAccessDeniedNotice(set));
+    }
+
+    private static string BuildAccessDeniedNotice(WeeklyModeSet set)
+    {
+        var discord = string.IsNullOrWhiteSpace(set.DiscordChannel)
+            ? "Discord-канале сервера"
+            : set.DiscordChannel;
+
+        return
+            $"Для участия в этом мероприятии необходимо иметь минимум {set.MinPlaytimeHours} часов игрового времени именно на этом сервере.\n\n" +
+            "Это ограничение используется для защиты мероприятия от организованных набегов и случайных нарушителей.\n\n" +
+            "Вы пока не можете выбирать роли, но можете наблюдать за игрой в качестве призрака.\n\n" +
+            $"Дополнительная информация о мероприятии находится в Discord-канале сервера: {discord}";
+    }
+
+    private static string FormatList(IEnumerable<string> values)
+    {
+        var ordered = values.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        return ordered.Length == 0 ? "<none>" : string.Join(", ", ordered);
+    }
+
+    private static string FormatDictionary<TValue>(IReadOnlyDictionary<string, TValue> values)
+    {
+        if (values.Count == 0)
+            return "<none>";
+
+        return string.Join(", ", values
+            .OrderBy(x => x.Key, StringComparer.Ordinal)
+            .Select(x => $"{x.Key}={x.Value}"));
+    }
+
     private static bool TryNormalizeAlias(string rawAlias, out string alias, out string message)
     {
         alias = rawAlias.Trim().Trim('"');
@@ -2415,6 +4142,19 @@ public sealed class WeeklyModeSystem : EntitySystem
                 message = "Alias may not contain markup brackets '[' or ']'.";
                 return false;
             }
+        }
+
+        message = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeTechnologyBranch(string rawBranch, out string branch, out string message)
+    {
+        branch = rawBranch.Trim().ToLowerInvariant();
+        if (!WeeklyTechnologyBranches.Contains(branch))
+        {
+            message = $"Branch must be one of: {string.Join(", ", WeeklyTechnologyBranches.OrderBy(x => x, StringComparer.Ordinal))}.";
+            return false;
         }
 
         message = string.Empty;

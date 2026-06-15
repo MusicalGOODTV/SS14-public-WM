@@ -200,6 +200,9 @@ public sealed partial class GameTicker
             return false;
 
         CurrentPreset = Preset;
+        if (_weeklyMode.ShouldSuppressAutomaticGameRules())
+            return false;
+
         foreach (var rule in Preset.Rules)
         {
             AddGameRule(rule);

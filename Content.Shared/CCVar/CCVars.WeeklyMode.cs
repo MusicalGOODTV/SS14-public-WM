@@ -8,7 +8,7 @@ public sealed partial class CCVars
 {
     [CVarControl(AdminFlags.Server)]
     public static readonly CVarDef<bool> WeeklyModeEnabled =
-        CVarDef.Create("weekly_mode.enabled", false, CVar.ARCHIVE | CVar.SERVERONLY);
+        CVarDef.Create("weekly_mode.enabled", true, CVar.ARCHIVE | CVar.SERVERONLY);
 
     [CVarControl(AdminFlags.Server)]
     public static readonly CVarDef<string> WeeklyModeDataRoot =
@@ -16,7 +16,7 @@ public sealed partial class CCVars
 
     [CVarControl(AdminFlags.Server, min: 1, max: 60)]
     public static readonly CVarDef<int> WeeklyModeDefaultAutosaveMinutes =
-        CVarDef.Create("weekly_mode.default_autosave_minutes", 10, CVar.ARCHIVE | CVar.SERVERONLY);
+        CVarDef.Create("weekly_mode.default_autosave_minutes", 30, CVar.ARCHIVE | CVar.SERVERONLY);
 
     [CVarControl(AdminFlags.Server, min: 1, max: 128)]
     public static readonly CVarDef<int> WeeklyModeDefaultRetainAutosaves =

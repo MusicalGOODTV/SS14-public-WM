@@ -24,12 +24,16 @@ namespace Content.Server.Cargo.Systems
 {
     public sealed partial class CargoSystem
     {
+        private const string WeeklyCargoCratePrototype = "CrateGenericSteel";
+        private const string WeeklyCargoCrateContainerId = "entity_storage";
+
         [Dependency] private readonly SharedTransformSystem _transformSystem = default!;
         [Dependency] private readonly EmagSystem _emag = default!;
         [Dependency] private readonly IGameTiming _timing = default!;
 
         private void InitializeConsole()
         {
+            SubscribeLocalEvent<WeeklyCargoCatalogChangedEvent>(OnWeeklyCargoCatalogChanged);
             SubscribeLocalEvent<CargoOrderConsoleComponent, CargoConsoleAddOrderMessage>(OnAddOrderMessage);
             SubscribeLocalEvent<CargoOrderConsoleComponent, CargoConsoleRemoveOrderMessage>(OnRemoveOrderMessage);
             SubscribeLocalEvent<CargoOrderConsoleComponent, CargoConsoleApproveOrderMessage>(OnApproveOrderMessage);
@@ -37,6 +41,11 @@ namespace Content.Server.Cargo.Systems
             SubscribeLocalEvent<CargoOrderConsoleComponent, ComponentInit>(OnInit);
             SubscribeLocalEvent<CargoOrderConsoleComponent, InteractUsingEvent>(OnInteractUsing);
             SubscribeLocalEvent<CargoOrderConsoleComponent, GotEmaggedEvent>(OnEmagged);
+        }
+
+        private void OnWeeklyCargoCatalogChanged(WeeklyCargoCatalogChangedEvent args)
+        {
+            UpdateAllOrderConsoles();
         }
 
         private void OnInteractUsingCash(EntityUid uid, CargoOrderConsoleComponent component, ref InteractUsingEvent args)
@@ -173,12 +182,21 @@ namespace Content.Server.Cargo.Systems
                 return;
             }
 
-            // Invalid order
-            if (!_protoMan.Resolve(order.Product, out var product))
+            CargoProductPrototype? product = null;
+            var productName = order.WeeklyProduct.Name;
+            var productCost = order.WeeklyProduct.Cost;
+
+            if (!order.IsWeeklyProduct)
             {
-                ConsolePopup(args.Actor, Loc.GetString("cargo-console-invalid-product"));
-                PlayDenySound(uid, component);
-                return;
+                if (!_protoMan.Resolve<CargoProductPrototype>(order.Product, out product))
+                {
+                    ConsolePopup(args.Actor, Loc.GetString("cargo-console-invalid-product"));
+                    PlayDenySound(uid, component);
+                    return;
+                }
+
+                productName = product.Name;
+                productCost = product.Cost;
             }
 
             var amount = GetOutstandingOrderCount((station.Value, orderDatabase), order.Account);
@@ -202,7 +220,7 @@ namespace Content.Server.Cargo.Systems
                 PlayDenySound(uid, component);
             }
 
-            var cost = product.Cost * order.OrderQuantity;
+            var cost = productCost * order.OrderQuantity;
             var accountBalance = GetBalanceFromAccount((station.Value, bank), order.Account);
 
             // Not enough balance
@@ -239,7 +257,7 @@ namespace Content.Server.Cargo.Systems
                 order.SetApproverData(tryGetIdentityShortInfoEvent.Title);
 
                 var message = Loc.GetString("cargo-console-unlock-approved-order-broadcast",
-                    ("productName", Loc.GetString(product.Name)),
+                    ("productName", productName),
                     ("orderAmount", order.OrderQuantity),
                     ("approver", order.Approver ?? string.Empty),
                     ("cost", cost));
@@ -370,24 +388,41 @@ namespace Content.Server.Cargo.Systems
             if (!TryComp<StationBankAccountComponent>(stationUid, out var bank))
                 return;
 
-            if (!_protoMan.TryIndex<CargoProductPrototype>(args.CargoProductId, out var product))
-            {
-                Log.Error($"Tried to add invalid cargo product {args.CargoProductId} as order!");
-                return;
-            }
-
-            if (!GetAvailableProducts((uid, component)).Contains(args.CargoProductId))
-                return;
-
-            if (component.Mode == CargoOrderConsoleMode.PrintSlip)
-            {
-                OnAddOrderMessageSlipPrinter(uid, component, args, product);
-                return;
-            }
-
             var targetAccount = component.Mode == CargoOrderConsoleMode.SendToPrimary ? bank.PrimaryAccount : component.Account;
+            CargoOrderData data;
 
-            var data = GetOrderData(args, product, GenerateOrderId(orderDatabase), component.Account);
+            if (_weeklyMode.TryGetActiveWeeklyCargoProduct(args.CargoProductId, out var weeklyProduct))
+            {
+                if (!GetAvailableWeeklyProducts((uid, component)).Any(product => product.ProductId == args.CargoProductId))
+                    return;
+
+                if (component.Mode == CargoOrderConsoleMode.PrintSlip)
+                {
+                    PlayDenySound(uid, component);
+                    return;
+                }
+
+                data = GetOrderData(args, weeklyProduct, GenerateOrderId(orderDatabase), component.Account);
+            }
+            else
+            {
+                if (!_protoMan.TryIndex<CargoProductPrototype>(args.CargoProductId, out var product))
+                {
+                    Log.Error($"Tried to add invalid cargo product {args.CargoProductId} as order!");
+                    return;
+                }
+
+                if (!GetAvailableProducts((uid, component)).Contains(args.CargoProductId))
+                    return;
+
+                if (component.Mode == CargoOrderConsoleMode.PrintSlip)
+                {
+                    OnAddOrderMessageSlipPrinter(uid, component, args, product);
+                    return;
+                }
+
+                data = GetOrderData(args, product, GenerateOrderId(orderDatabase), component.Account);
+            }
 
             if (!TryAddOrder(stationUid.Value, targetAccount, data, orderDatabase))
             {
@@ -428,7 +463,8 @@ namespace Content.Server.Cargo.Systems
                     orderDatabase.Capacity,
                     GetNetEntity(station.Value),
                     RelevantOrders((station!.Value, orderDatabase), (consoleUid, console)),
-                    GetAvailableProducts((consoleUid, console))
+                    GetAvailableProducts((consoleUid, console)),
+                    GetAvailableWeeklyProducts((consoleUid, console))
                 ));
             }
         }
@@ -466,6 +502,11 @@ namespace Content.Server.Cargo.Systems
         }
 
         private static CargoOrderData GetOrderData(CargoConsoleAddOrderMessage args, CargoProductPrototype cargoProduct, int id, ProtoId<CargoAccountPrototype> account)
+        {
+            return new CargoOrderData(id, cargoProduct, args.Amount, args.Requester, args.Reason, account);
+        }
+
+        private static CargoOrderData GetOrderData(CargoConsoleAddOrderMessage args, WeeklyCargoProductData cargoProduct, int id, ProtoId<CargoAccountPrototype> account)
         {
             return new CargoOrderData(id, cargoProduct, args.Amount, args.Requester, args.Reason, account);
         }
@@ -514,6 +555,17 @@ namespace Content.Server.Cargo.Systems
                 if (station != dbUid)
                     continue;
 
+                UpdateOrderState(uid, station);
+            }
+        }
+
+        private void UpdateAllOrderConsoles()
+        {
+            var orderQuery = AllEntityQuery<CargoOrderConsoleComponent>();
+
+            while (orderQuery.MoveNext(out var uid, out _))
+            {
+                var station = _station.GetOwningStation(uid);
                 UpdateOrderState(uid, station);
             }
         }
@@ -616,7 +668,10 @@ namespace Content.Server.Cargo.Systems
         /// </summary>
         private bool FulfillOrder(CargoOrderData order, ProtoId<CargoAccountPrototype> account, EntityCoordinates spawn, string? paperProto)
         {
-            if (!_protoMan.Resolve(order.Product, out var product))
+            if (order.IsWeeklyProduct)
+                return FulfillWeeklyOrder(order, account, spawn, paperProto);
+
+            if (!_protoMan.Resolve<CargoProductPrototype>(order.Product, out var product))
                 return false;
 
             // Create the item itself
@@ -636,7 +691,7 @@ namespace Content.Server.Cargo.Systems
                     !_container.Insert(item, container1, force: true))
                 {
                     DebugTools.Assert(
-                        $"Failed to insert cargo product into its specified container. This indicates an error in the cargo product definition's YAML as the product should be insertable into its container. {nameof(CargoProductPrototype)}: {(ProtoId<CargoProductPrototype>)order.Product.Id}");
+                        $"Failed to insert cargo product into its specified container. This indicates an error in the cargo product definition's YAML as the product should be insertable into its container. {nameof(CargoProductPrototype)}: {order.Product}");
                     QueueDel(containerEntity);
                 }
                 else
@@ -645,6 +700,75 @@ namespace Content.Server.Cargo.Systems
                 }
             }
 
+            PrintCargoOrderPaper(item, order, account, spawn, paperProto, product.Name);
+            return true;
+        }
+
+        private bool FulfillWeeklyOrder(CargoOrderData order, ProtoId<CargoAccountPrototype> account, EntityCoordinates spawn, string? paperProto)
+        {
+            var product = order.WeeklyProduct;
+            if (product.Amount < 1 || string.IsNullOrWhiteSpace(product.ItemPrototype))
+                return false;
+
+            EntityUid item;
+            if (product.Boxed)
+            {
+                var containerEntity = Spawn(WeeklyCargoCratePrototype, spawn);
+                _transformSystem.Unanchor(containerEntity, Transform(containerEntity));
+
+                if (!_container.TryGetContainer(containerEntity, WeeklyCargoCrateContainerId, out var container))
+                {
+                    QueueDel(containerEntity);
+                    return false;
+                }
+
+                var spawnedItems = new List<EntityUid>();
+                for (var i = 0; i < product.Amount; i++)
+                {
+                    var child = Spawn(product.ItemPrototype, spawn);
+                    spawnedItems.Add(child);
+                    _transformSystem.Unanchor(child, Transform(child));
+
+                    if (_container.Insert(child, container, force: true))
+                        continue;
+
+                    foreach (var spawned in spawnedItems)
+                        QueueDel(spawned);
+
+                    QueueDel(containerEntity);
+                    return false;
+                }
+
+                item = containerEntity;
+            }
+            else
+            {
+                EntityUid? firstItem = null;
+                for (var i = 0; i < product.Amount; i++)
+                {
+                    var child = Spawn(product.ItemPrototype, spawn);
+                    _transformSystem.Unanchor(child, Transform(child));
+                    firstItem ??= child;
+                }
+
+                if (firstItem == null)
+                    return false;
+
+                item = firstItem.Value;
+            }
+
+            PrintCargoOrderPaper(item, order, account, spawn, paperProto, product.Name);
+            return true;
+        }
+
+        private void PrintCargoOrderPaper(
+            EntityUid item,
+            CargoOrderData order,
+            ProtoId<CargoAccountPrototype> account,
+            EntityCoordinates spawn,
+            string? paperProto,
+            string itemName)
+        {
             // Create a sheet of paper to write the order details on
             var printed = Spawn(paperProto, spawn);
             if (TryComp<PaperComponent>(printed, out var paper))
@@ -658,7 +782,7 @@ namespace Content.Server.Cargo.Systems
                     Loc.GetString(
                         "cargo-console-paper-print-text",
                         ("orderNumber", order.OrderId),
-                        ("itemName", product.Name),
+                        ("itemName", itemName),
                         ("orderQuantity", order.OrderQuantity),
                         ("requester", order.Requester),
                         ("reason", string.IsNullOrWhiteSpace(order.Reason) ? Loc.GetString("cargo-console-paper-reason-default") : order.Reason),
@@ -672,9 +796,6 @@ namespace Content.Server.Cargo.Systems
                     _slots.TryInsert(item, label.LabelSlot, printed, null);
                 }
             }
-
-            return true;
-
         }
 
         public List<ProtoId<CargoProductPrototype>> GetAvailableProducts(Entity<CargoOrderConsoleComponent> ent)
@@ -689,6 +810,9 @@ namespace Content.Server.Cargo.Systems
 
             // Note that a market must be both on the station and on the console to be available.
             var markets = ent.Comp.AllowedGroups.Intersect(db.Markets).ToList();
+            if (_weeklyMode.TryGetActiveWeeklyCargoProducts(out _))
+                return products;
+
             foreach (var product in _protoMan.EnumeratePrototypes<CargoProductPrototype>())
             {
                 if (!markets.Contains(product.Group))
@@ -696,6 +820,25 @@ namespace Content.Server.Cargo.Systems
 
                 products.Add(product.ID);
             }
+
+            return products;
+        }
+
+        public List<WeeklyCargoProductData> GetAvailableWeeklyProducts(Entity<CargoOrderConsoleComponent> ent)
+        {
+            if (_station.GetOwningStation(ent) is not { } station ||
+                !TryComp<StationCargoOrderDatabaseComponent>(station, out var db))
+            {
+                return new List<WeeklyCargoProductData>();
+            }
+
+            if (!_weeklyMode.TryGetActiveWeeklyCargoProducts(out var products))
+                return new List<WeeklyCargoProductData>();
+
+            // Weekly cargo products are campaign-local additions to the normal market.
+            var markets = ent.Comp.AllowedGroups.Intersect(db.Markets).ToList();
+            if (!markets.Contains("market"))
+                return new List<WeeklyCargoProductData>();
 
             return products;
         }

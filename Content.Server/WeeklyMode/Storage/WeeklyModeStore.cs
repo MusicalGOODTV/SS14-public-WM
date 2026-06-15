@@ -1,6 +1,8 @@
 using System.Diagnostics.CodeAnalysis;
 using System;
 using System.IO;
+using System.Linq;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Content.Shared.WeeklyMode;
@@ -11,6 +13,16 @@ namespace Content.Server.WeeklyMode.Storage;
 
 public sealed class WeeklyModeStore
 {
+    private static readonly string[] DefaultExcludedMobPrototypes =
+    {
+        "MobMouse",
+        "MobMouseDead",
+        "MobMouseAdmeme",
+        "MobMouse1",
+        "MobMouse2",
+        "MobMouseCancer",
+    };
+
     public const string StationFileName = "station.yml";
     public const string SnapshotMetadataFileName = "snapshot.json";
     public const string RoleOverridesFileName = "role-overrides.json";
@@ -20,6 +32,7 @@ public sealed class WeeklyModeStore
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         Converters = { new JsonStringEnumConverter() },
     };
 
@@ -59,7 +72,7 @@ public sealed class WeeklyModeStore
         return id is not "." and not "..";
     }
 
-    public WeeklyModeSet CreateSet(string setId, string baseMapPrototype, int autosaveMinutes, int retainAutosaves, string? displayName = null)
+    public WeeklyModeSet CreateSet(string setId, string baseMapPrototype, int autosaveMinutes, int retainAutosaves, string? displayName = null, string? baseMapPath = null)
     {
         ValidateId(setId, nameof(setId));
 
@@ -68,7 +81,9 @@ public sealed class WeeklyModeStore
             SetId = setId,
             DisplayName = string.IsNullOrWhiteSpace(displayName) ? setId : displayName,
             BaseMapPrototype = baseMapPrototype,
+            BaseMapPath = baseMapPath ?? string.Empty,
             AutosaveMinutes = autosaveMinutes,
+            AutosaveWarningMinutes = 2,
             RetainAutosaves = retainAutosaves,
         };
 
@@ -82,7 +97,11 @@ public sealed class WeeklyModeStore
         if (!IsSafeId(setId))
             return false;
 
-        return TryReadJson(SetPath(setId), out set);
+        if (!TryReadJson(SetPath(setId), out set))
+            return false;
+
+        NormalizeSet(set);
+        return true;
     }
 
     public WeeklyModeSet LoadSet(string setId)
@@ -96,7 +115,45 @@ public sealed class WeeklyModeStore
     public void SaveSet(WeeklyModeSet set)
     {
         ValidateId(set.SetId, nameof(set.SetId));
+        NormalizeSet(set);
         WriteJson(SetPath(set.SetId), set);
+    }
+
+    public string ExportSetJson(WeeklyModeSet set)
+    {
+        NormalizeSet(set);
+        return JsonSerializer.Serialize(set, JsonOptions);
+    }
+
+    private static void NormalizeSet(WeeklyModeSet set)
+    {
+        set.DisplayName ??= set.SetId;
+        set.BaseMapPrototype ??= string.Empty;
+        set.BaseMapPath ??= string.Empty;
+        set.CurrentSnapshot = string.IsNullOrWhiteSpace(set.CurrentSnapshot) ? null : set.CurrentSnapshot;
+        set.Snapshots ??= new List<string>();
+        set.DefaultDisabledJobs ??= new List<string>();
+        set.DefaultRoleAliases ??= new Dictionary<string, string>();
+        set.DefaultRoleLimits ??= new Dictionary<string, int>();
+        set.ExcludedMobPrototypes ??= DefaultExcludedMobPrototypes.ToList();
+        set.DiscordChannel ??= string.Empty;
+        set.WeeklyTechnologies ??= new List<WeeklyTechnologyEntry>();
+        set.WeeklyCargoProducts ??= new List<WeeklyCargoProductEntry>();
+        set.CampaignState ??= new Dictionary<string, string>();
+
+        foreach (var technology in set.WeeklyTechnologies)
+        {
+            technology.TechnologyId ??= string.Empty;
+            technology.Branch ??= string.Empty;
+            technology.RecipeIds ??= new List<string>();
+        }
+
+        foreach (var product in set.WeeklyCargoProducts)
+        {
+            product.ProductId ??= string.Empty;
+            product.Category ??= string.Empty;
+            product.ItemPrototype ??= string.Empty;
+        }
     }
 
     public IEnumerable<string> ListSetIds()
@@ -278,8 +335,8 @@ public sealed class WeeklyModeStore
         ValidateId(snapshotId, nameof(snapshotId));
 
         var finalDirectory = SnapshotDirectory(setId, snapshotId);
-        var tempPath = GetUserDataDirectoryPath(tempDirectory);
-        var finalPath = GetUserDataDirectoryPath(finalDirectory);
+        var tempPath = GetUserDataPath(tempDirectory);
+        var finalPath = GetUserDataPath(finalDirectory);
         var finalParentPath = Path.GetDirectoryName(finalPath)
             ?? throw new InvalidOperationException($"Could not resolve parent directory for '{finalDirectory}'.");
         var backupPath = GetBackupDirectoryPath(finalPath);
@@ -375,19 +432,125 @@ public sealed class WeeklyModeStore
     private void WriteJson<T>(ResPath path, T value)
     {
         _resource.UserData.CreateDir(path.Directory);
-        var tmpPath = path.WithName($"{path.Filename}.tmp");
+        var tmpPath = path.WithName($".tmp-{path.Filename}-{Guid.NewGuid():N}");
         var json = JsonSerializer.Serialize(value, JsonOptions);
         _resource.UserData.WriteAllText(tmpPath, json);
-        _resource.UserData.Delete(path);
-        _resource.UserData.Rename(tmpPath, path);
+        ReplaceUserDataFile(tmpPath, path);
     }
 
-    private string GetUserDataDirectoryPath(ResPath path)
+    private void ReplaceUserDataFile(ResPath tempPath, ResPath finalPath)
     {
-        var rootDir = _resource.UserData.RootDir;
-        if (string.IsNullOrWhiteSpace(rootDir))
-            throw new NotSupportedException("Weekly mode snapshot directory replacement requires a real user data directory.");
+        if (string.IsNullOrWhiteSpace(_resource.UserData.RootDir))
+        {
+            ReplaceUserDataFileWithProvider(tempPath, finalPath);
+            return;
+        }
 
+        var tempFullPath = GetUserDataPath(tempPath);
+        var finalFullPath = GetUserDataPath(finalPath);
+        var finalParentPath = Path.GetDirectoryName(finalFullPath)
+            ?? throw new InvalidOperationException($"Could not resolve parent directory for '{finalPath}'.");
+        var backupPath = GetBackupFilePath(finalFullPath);
+
+        EnsureSameVolume(tempFullPath, finalFullPath);
+        EnsureSameVolume(finalFullPath, backupPath);
+
+        if (!File.Exists(tempFullPath))
+            throw new FileNotFoundException($"Weekly config temp file does not exist: {tempPath}");
+
+        if (Directory.Exists(tempFullPath))
+            throw new IOException($"Weekly config temp path is a directory, not a file: {tempPath}");
+
+        Directory.CreateDirectory(finalParentPath);
+
+        var backedUpExisting = false;
+        var movedTempToFinal = false;
+
+        try
+        {
+            if (Directory.Exists(finalFullPath))
+                throw new IOException($"Weekly config destination is a directory, not a file: {finalPath}");
+
+            if (File.Exists(finalFullPath))
+            {
+                File.Move(finalFullPath, backupPath);
+                backedUpExisting = true;
+            }
+
+            File.Move(tempFullPath, finalFullPath);
+            movedTempToFinal = true;
+        }
+        catch
+        {
+            if (backedUpExisting && File.Exists(backupPath))
+            {
+                if (File.Exists(finalFullPath))
+                    File.Delete(finalFullPath);
+
+                File.Move(backupPath, finalFullPath);
+            }
+
+            if (!movedTempToFinal && File.Exists(tempFullPath))
+                File.Delete(tempFullPath);
+
+            throw;
+        }
+
+        if (backedUpExisting && File.Exists(backupPath))
+            File.Delete(backupPath);
+    }
+
+    private void ReplaceUserDataFileWithProvider(ResPath tempPath, ResPath finalPath)
+    {
+        EnsureSafeUserDataPath(tempPath);
+        EnsureSafeUserDataPath(finalPath);
+
+        if (!_resource.UserData.Exists(tempPath))
+            throw new FileNotFoundException($"Weekly config temp file does not exist: {tempPath}");
+
+        if (_resource.UserData.IsDir(tempPath))
+            throw new IOException($"Weekly config temp path is a directory, not a file: {tempPath}");
+
+        if (_resource.UserData.Exists(finalPath) && _resource.UserData.IsDir(finalPath))
+            throw new IOException($"Weekly config destination is a directory, not a file: {finalPath}");
+
+        var backupPath = finalPath.WithName($".backup-{finalPath.Filename}-{Guid.NewGuid():N}");
+        var backedUpExisting = false;
+        var movedTempToFinal = false;
+
+        try
+        {
+            if (_resource.UserData.Exists(finalPath))
+            {
+                _resource.UserData.Rename(finalPath, backupPath);
+                backedUpExisting = true;
+            }
+
+            _resource.UserData.Rename(tempPath, finalPath);
+            movedTempToFinal = true;
+        }
+        catch
+        {
+            if (backedUpExisting && _resource.UserData.Exists(backupPath))
+            {
+                if (_resource.UserData.Exists(finalPath))
+                    _resource.UserData.Delete(finalPath);
+
+                _resource.UserData.Rename(backupPath, finalPath);
+            }
+
+            if (!movedTempToFinal && _resource.UserData.Exists(tempPath))
+                _resource.UserData.Delete(tempPath);
+
+            throw;
+        }
+
+        if (backedUpExisting && _resource.UserData.Exists(backupPath))
+            _resource.UserData.Delete(backupPath);
+    }
+
+    private static void EnsureSafeUserDataPath(ResPath path)
+    {
         if (!path.IsRooted)
             throw new InvalidOperationException($"Weekly mode path must be rooted: {path}");
 
@@ -397,8 +560,18 @@ public sealed class WeeklyModeStore
         var relativePath = path.ToRelativeSystemPath();
         if (Path.IsPathRooted(relativePath) || Path.IsPathFullyQualified(relativePath))
             throw new InvalidOperationException($"Weekly mode path may not resolve to an external absolute path: {path}");
+    }
+
+    private string GetUserDataPath(ResPath path)
+    {
+        var rootDir = _resource.UserData.RootDir;
+        if (string.IsNullOrWhiteSpace(rootDir))
+            throw new NotSupportedException("Weekly mode atomic file replacement requires a real user data directory.");
+
+        EnsureSafeUserDataPath(path);
 
         var rootPath = NormalizeRootDirectory(rootDir);
+        var relativePath = path.ToRelativeSystemPath();
         var fullPath = Path.GetFullPath(Path.Combine(rootPath, relativePath));
         EnsurePathInsideRoot(fullPath, rootPath, path);
         return fullPath;
@@ -409,6 +582,17 @@ public sealed class WeeklyModeStore
         var finalParentPath = Path.GetDirectoryName(finalPath)
             ?? throw new InvalidOperationException($"Could not resolve parent directory for '{finalPath}'.");
         var finalName = Path.GetFileName(Path.TrimEndingDirectorySeparator(finalPath));
+        var backupPath = Path.Combine(finalParentPath, $".backup-{finalName}-{Guid.NewGuid():N}");
+        var rootPath = NormalizeRootDirectory(_resource.UserData.RootDir!);
+        EnsurePathInsideRoot(backupPath, rootPath, new ResPath(backupPath.Replace('\\', '/')));
+        return backupPath;
+    }
+
+    private string GetBackupFilePath(string finalPath)
+    {
+        var finalParentPath = Path.GetDirectoryName(finalPath)
+            ?? throw new InvalidOperationException($"Could not resolve parent directory for '{finalPath}'.");
+        var finalName = Path.GetFileName(finalPath);
         var backupPath = Path.Combine(finalParentPath, $".backup-{finalName}-{Guid.NewGuid():N}");
         var rootPath = NormalizeRootDirectory(_resource.UserData.RootDir!);
         EnsurePathInsideRoot(backupPath, rootPath, new ResPath(backupPath.Replace('\\', '/')));

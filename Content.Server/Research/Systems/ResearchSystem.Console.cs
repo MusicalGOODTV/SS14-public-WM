@@ -7,6 +7,7 @@ using Content.Shared.Emag.Systems;
 using Content.Shared.IdentityManagement;
 using Content.Shared.Research.Components;
 using Content.Shared.Research.Prototypes;
+using Content.Shared.Research;
 
 namespace Content.Server.Research.Systems;
 
@@ -32,8 +33,19 @@ public sealed partial class ResearchSystem
         if (!this.IsPowered(uid, EntityManager))
             return;
 
-        if (!PrototypeManager.TryIndex<TechnologyPrototype>(args.Id, out var technologyPrototype))
-            return;
+        TechnologyPrototype? technologyPrototype = null;
+        WeeklyTechnologyData? weeklyTechnology = null;
+        if (!PrototypeManager.TryIndex<TechnologyPrototype>(args.Id, out technologyPrototype))
+        {
+            if (!TryComp<TechnologyDatabaseComponent>(uid, out var database) ||
+                !database.WeeklyModeOnly ||
+                !TryGetWeeklyTechnology(database, args.Id, out var weeklyTechnologyData))
+            {
+                return;
+            }
+
+            weeklyTechnology = weeklyTechnologyData;
+        }
 
         if (TryComp<AccessReaderComponent>(uid, out var access) && !_accessReader.IsAllowed(act, uid, access))
         {
@@ -49,10 +61,14 @@ public sealed partial class ResearchSystem
             var getIdentityEvent = new TryGetIdentityShortInfoEvent(uid, act);
             RaiseLocalEvent(getIdentityEvent);
 
+            var technologyName = technologyPrototype != null
+                ? Loc.GetString(technologyPrototype.Name)
+                : weeklyTechnology?.Name ?? args.Id;
+            var technologyCost = technologyPrototype?.Cost ?? weeklyTechnology?.Cost ?? 0;
             var message = Loc.GetString(
                 "research-console-unlock-technology-radio-broadcast",
-                ("technology", Loc.GetString(technologyPrototype.Name)),
-                ("amount", technologyPrototype.Cost),
+                ("technology", technologyName),
+                ("amount", technologyCost),
                 ("approver", getIdentityEvent.Title ?? string.Empty)
             );
             _radio.SendRadioMessage(uid, message, component.AnnouncementChannel, uid, escapeMarkup: false);
@@ -85,6 +101,19 @@ public sealed partial class ResearchSystem
         }
 
         _uiSystem.SetUiState(uid, ResearchConsoleUiKey.Key, state);
+    }
+
+    public void RefreshResearchConsoles()
+    {
+        var query = EntityQueryEnumerator<ResearchConsoleComponent>();
+        while (query.MoveNext(out var uid, out var component))
+        {
+            if (!_uiSystem.IsUiOpen(uid, ResearchConsoleUiKey.Key))
+                continue;
+
+            SyncClientWithServer(uid);
+            UpdateConsoleInterface(uid, component);
+        }
     }
 
     private void OnPointsChanged(EntityUid uid, ResearchConsoleComponent component, ref ResearchServerPointsChangedEvent args)

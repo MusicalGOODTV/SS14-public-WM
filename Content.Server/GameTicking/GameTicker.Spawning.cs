@@ -64,6 +64,21 @@ namespace Content.Server.GameTicking
             Dictionary<NetUserId, HumanoidCharacterProfile> profiles,
             bool force)
         {
+            for (var i = readyPlayers.Count - 1; i >= 0; i--)
+            {
+                var player = readyPlayers[i];
+                if (_weeklyMode.IsWeeklyAccessAllowed(player, true))
+                    continue;
+
+                readyPlayers.RemoveAt(i);
+                profiles.Remove(player.UserId);
+                _playerGameStatuses[player.UserId] = PlayerGameStatus.NotReadyToPlay;
+                RaiseNetworkEvent(GetStatusMsg(player), player.Channel);
+            }
+
+            if (readyPlayers.Count == 0)
+                return;
+
             // Allow game rules to spawn players by themselves if needed. (For example, nuke ops or wizard)
             RaiseLocalEvent(new RulePlayerSpawningEvent(readyPlayers, profiles, force));
 
@@ -389,6 +404,9 @@ namespace Content.Server.GameTicking
                 return;
 
             if (!_userDb.IsLoadComplete(player))
+                return;
+
+            if (!_weeklyMode.IsWeeklyAccessAllowed(player, true))
                 return;
 
             SpawnPlayer(player, station, jobId, silent: silent);
