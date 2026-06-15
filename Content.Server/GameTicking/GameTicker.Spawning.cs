@@ -361,7 +361,7 @@ namespace Content.Server.GameTicking
             _mind.TransferTo(newMind, mob);
 
             _roles.MindAddJobRole(newMind, silent: silent, jobPrototype: jobId);
-            jobName = _jobs.MindTryGetJobName(newMind);
+            jobName = _weeklyMode.GetJobDisplayName(jobPrototype.ID);
             _admin.UpdatePlayerList(player);
         }
 

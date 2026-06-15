@@ -1,4 +1,5 @@
 using Content.Shared.Maps;
+using Robust.Shared.Utility;
 
 namespace Content.Server.Maps;
 
@@ -51,6 +52,12 @@ public interface IGameMapManager
     /// <param name="gameMap">map prototype</param>
     /// <returns>success or failure</returns>
     void SelectMap(string gameMap);
+
+    /// <summary>
+    /// Selects a map prototype, replacing its map path with a saved user-data map if it exists.
+    /// Falls back to the base map prototype if the saved map path is missing.
+    /// </summary>
+    void SelectPersistentMap(string baseMapPrototype, ResPath mapPath);
 
     /// <summary>
     /// Selects a random map eligible map

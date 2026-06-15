@@ -236,7 +236,7 @@ namespace Content.Client.LateJoin
                             Margin = new Thickness(5f, 0, 0, 0)
                         };
 
-                        var jobButton = new JobButton(jobLabel, prototype.ID, prototype.LocalizedName, value);
+                        var jobButton = new JobButton(jobLabel, prototype.ID, _gameTicker.GetJobDisplayName(prototype), value);
 
                         var jobSelector = new BoxContainer
                         {

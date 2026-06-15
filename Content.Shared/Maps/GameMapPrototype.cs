@@ -62,9 +62,16 @@ public sealed partial class GameMapPrototype : IPrototype
         return new()
         {
             ID = ID,
+            MaxRandomOffset = MaxRandomOffset,
+            IsGrid = IsGrid,
+            RandomRotation = RandomRotation,
             MapName = MapName,
             MapPath = mapPath,
-            _stations = _stations
+            _stations = _stations,
+            Fallback = Fallback,
+            MinPlayers = MinPlayers,
+            MaxPlayers = MaxPlayers,
+            _conditions = _conditions
         };
 #pragma warning restore RA0039
     }

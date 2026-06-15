@@ -10,7 +10,6 @@ on:
 
 jobs:
   build:
-    if: false
     strategy:
       matrix:
         os: [ubuntu-latest]
@@ -60,6 +59,21 @@ jobs:
       with:
         name: nunit3-results-${{ matrix.os }}
         path: test_results/*
+        retention-days: 7
+        compression-level: 9
+
+    - name: Archive Weekly Mode snapshot artifacts on failure.
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: weekly-mode-snapshot-artifacts-${{ matrix.os }}
+        path: |
+          **/weekly-mode/**/station.yml
+          **/weekly-mode/**/snapshot.json
+          **/weekly-mode/**/container-patch.json
+          **/weekly-mode/**/*.log
+          test_results/**/*.log
+        if-no-files-found: warn
         retention-days: 7
         compression-level: 9
   ci-success:

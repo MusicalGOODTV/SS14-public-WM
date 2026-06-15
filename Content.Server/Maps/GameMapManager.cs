@@ -131,7 +131,7 @@ public sealed class GameMapManager : IGameMapManager
 
     public GameMapPrototype? GetSelectedMap()
     {
-        return _configSelectedMap ?? _selectedMap;
+        return _selectedMap ?? _configSelectedMap;
     }
 
     public void ClearSelectedMap()
@@ -152,6 +152,22 @@ public sealed class GameMapManager : IGameMapManager
         if (!TryLookupMap(gameMap, out var map))
             throw new ArgumentException($"The map \"{gameMap}\" is invalid!");
         _selectedMap = map;
+    }
+
+    public void SelectPersistentMap(string baseMapPrototype, ResPath mapPath)
+    {
+        if (!TryLookupMap(baseMapPrototype, out var map))
+            throw new ArgumentException($"The map \"{baseMapPrototype}\" is invalid!");
+
+        if (_resMan.UserData.Exists(mapPath))
+        {
+            _selectedMap = map.Persistence(mapPath);
+            _log.Info($"Using persistence map from {mapPath}");
+            return;
+        }
+
+        _selectedMap = map;
+        _log.Warning($"Using persistence start map {baseMapPrototype} as {mapPath} doesn't exist");
     }
 
     public void SelectMapRandom()

@@ -140,6 +140,12 @@ namespace Content.Shared.VendingMachines
         public float InitialStockQuality = 1.0f;
 
         /// <summary>
+        /// Skips the spawn-time inventory fill for persistent snapshots that already carry authoritative stock.
+        /// </summary>
+        [DataField]
+        public bool SuppressInitialRestock;
+
+        /// <summary>
         ///     While disabled by EMP it randomly ejects items
         /// </summary>
         [DataField(customTypeSerializer: typeof(TimeOffsetSerializer))]
