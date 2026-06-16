@@ -1,9 +1,13 @@
 #nullable enable
+using System.Collections.Generic;
 using System.Linq;
 using Content.IntegrationTests.Fixtures;
 using Content.IntegrationTests.Fixtures.Attributes;
 using Content.Server.Cargo.Components;
 using Content.Server.Cargo.Systems;
+using Content.Server.Lathe;
+using Content.Server.Materials;
+using Content.Server.Power.Components;
 using Content.Server.Research.Systems;
 using Content.Server.Station.Systems;
 using Content.Server.WeeklyMode.Systems;
@@ -12,12 +16,17 @@ using Content.Shared.Cargo.BUI;
 using Content.Shared.Cargo.Components;
 using Content.Shared.Cargo.Prototypes;
 using Content.Shared.CCVar;
+using Content.Shared.Lathe;
+using Content.Shared.Maps;
+using Content.Shared.Preferences;
 using Content.Shared.Research.Components;
 using Content.Shared.Research.Prototypes;
+using Content.Shared.Roles;
 using Content.Shared.Station.Components;
 using Robust.Shared.Console;
 using Robust.Shared.GameObjects;
 using Robust.Shared.Map;
+using Robust.Shared.Network;
 using Robust.Shared.Prototypes;
 
 namespace Content.IntegrationTests.Tests.WeeklyMode;
@@ -26,9 +35,12 @@ namespace Content.IntegrationTests.Tests.WeeklyMode;
 public sealed class WeeklyModeLiveEditingTest : GameTest
 {
     private const string EmptyMapPath = "/Maps/Test/empty.yml";
+    private const string ForcedRolesMapId = "WeeklyForcedRoleStationMap";
     private const string FirstRecipe = "PowerDrill";
     private const string SecondRecipe = "Welder";
     private const string CargoItem = "SheetSteel";
+    private static readonly ProtoId<JobPrototype> Captain = "Captain";
+    private static readonly ProtoId<JobPrototype> Passenger = "Passenger";
 
     [Test]
     public async Task AddUpdateAndRemoveResearchDuringActiveCampaignRefreshesRuntimeDatabase()
@@ -237,6 +249,233 @@ public sealed class WeeklyModeLiveEditingTest : GameTest
         });
     }
 
+    [Test]
+    public async Task WeeklyRecipeUnlockAppearsOnTargetLatheAndProducesResult()
+    {
+        var setId = UniqueSetId();
+        EntityUid securityLathe = default;
+        int gasMasksBefore = 0;
+        int steelAfterQueue = 0;
+
+        await UseIsolatedWeeklyRoot();
+
+        await Server.WaitPost(() =>
+        {
+            var commandHost = Server.ResolveDependency<IConsoleHost>();
+            var weekly = SEntMan.System<WeeklyModeSystem>();
+            var research = SEntMan.System<ResearchSystem>();
+            var lathe = SEntMan.System<LatheSystem>();
+            var materials = SEntMan.System<MaterialStorageSystem>();
+            var ui = SEntMan.System<SharedUserInterfaceSystem>();
+
+            Assert.That(weekly.TryCreateSet(setId, EmptyMapPath, "Weekly recipe test", out var message), Is.True, message);
+            commandHost.ExecuteCommand($"wm.recipe {setId} add WeeklyGasMaskRecipe ClothingMaskGas 2 0.01 security Steel:100");
+            commandHost.ExecuteCommand($"wm.tech {setId} arsenal add WeeklyGasMasks 0 1 WeeklyGasMaskRecipe");
+            Assert.That(weekly.ValidateRecipes(setId), Does.Contain("are valid"));
+            Assert.That(weekly.TryStart(setId, null, "integration-test", out message), Is.True, message);
+
+            securityLathe = SEntMan.SpawnEntity("SecurityTechFab", MapCoordinates.Nullspace);
+            var medicalLathe = SEntMan.SpawnEntity("MedicalTechFab", MapCoordinates.Nullspace);
+            PowerLathe(securityLathe);
+            PowerLathe(medicalLathe);
+
+            var securityLatheComp = SEntMan.GetComponent<LatheComponent>(securityLathe);
+            var medicalLatheComp = SEntMan.GetComponent<LatheComponent>(medicalLathe);
+            var securityDatabase = SEntMan.GetComponent<TechnologyDatabaseComponent>(securityLathe);
+            var medicalDatabase = SEntMan.GetComponent<TechnologyDatabaseComponent>(medicalLathe);
+            var technology = securityDatabase.WeeklyTechnologies.Single(entry => entry.TechnologyId == "WeeklyGasMasks");
+            research.AddWeeklyTechnology(securityLathe, technology, securityDatabase);
+            research.AddWeeklyTechnology(medicalLathe, technology, medicalDatabase);
+
+            var securityRecipes = weekly.GetAvailableWeeklyLatheRecipes(securityLathe, securityLatheComp);
+            var medicalRecipes = weekly.GetAvailableWeeklyLatheRecipes(medicalLathe, medicalLatheComp);
+            Assert.Multiple(() =>
+            {
+                Assert.That(securityRecipes.Select(recipe => recipe.RecipeId), Is.EqualTo(new[] { "WeeklyGasMaskRecipe" }));
+                Assert.That(medicalRecipes.Select(recipe => recipe.RecipeId), Does.Not.Contain("WeeklyGasMaskRecipe"));
+                Assert.That(ui.TryGetUiState<LatheUpdateState>(securityLathe, LatheUiKey.Key, out var state), Is.True);
+                Assert.That(state!.WeeklyRecipes.Select(recipe => recipe.RecipeId), Contains.Item("WeeklyGasMaskRecipe"));
+            });
+
+            Assert.That(materials.TryChangeMaterialAmount(securityLathe, "Steel", 1000), Is.True);
+            Assert.That(lathe.TryAddWeeklyToQueue(securityLathe, securityRecipes.Single(), 1, securityLatheComp), Is.True);
+            steelAfterQueue = materials.GetMaterialAmount(securityLathe, "Steel");
+            Assert.That(steelAfterQueue, Is.EqualTo(900));
+            gasMasksBefore = CountEntitiesByPrototype("ClothingMaskGas");
+            Assert.That(lathe.TryStartProducing(securityLathe, securityLatheComp), Is.True);
+        });
+
+        await RunSeconds(0.2f);
+
+        await Server.WaitPost(() =>
+        {
+            var materials = SEntMan.System<MaterialStorageSystem>();
+            var securityLatheComp = SEntMan.GetComponent<LatheComponent>(securityLathe);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(CountEntitiesByPrototype("ClothingMaskGas"), Is.EqualTo(gasMasksBefore + 2));
+                Assert.That(materials.GetMaterialAmount(securityLathe, "Steel"), Is.EqualTo(steelAfterQueue));
+                Assert.That(securityLatheComp.CurrentRecipe, Is.Null);
+                Assert.That(securityLatheComp.Queue, Is.Empty);
+            });
+        });
+    }
+
+    [Test]
+    public async Task ForcedRoundStartRoleIgnoresMissingPrefsAndPriorityNever()
+    {
+        var setId = UniqueSetId();
+
+        await UseIsolatedWeeklyRoot();
+
+        await Server.WaitPost(() =>
+        {
+            var weekly = SEntMan.System<WeeklyModeSystem>();
+            var stationJobs = SEntMan.System<StationJobsSystem>();
+            StartWeeklySet(weekly, setId);
+
+            var forcedPlayer = new NetUserId(Guid.NewGuid());
+            var competingPlayer = new NetUserId(Guid.NewGuid());
+            Assert.That(weekly.TryForceRole(setId, forcedPlayer, "forced-never", Captain, false, "integration-test", out var message),
+                Is.True,
+                message);
+
+            var station = CreateForcedRoleStation();
+            var forcedProfile = HumanoidCharacterProfile.Random()
+                .WithJobPriority(Captain, JobPriority.Never)
+                .WithJobPriority(Passenger, JobPriority.Medium);
+            var competingProfile = HumanoidCharacterProfile.Random()
+                .WithJobPriority(Captain, JobPriority.High)
+                .WithJobPriority(Passenger, JobPriority.Medium);
+            var profiles = new Dictionary<NetUserId, HumanoidCharacterProfile>
+            {
+                [forcedPlayer] = forcedProfile,
+                [competingPlayer] = competingProfile,
+            };
+
+            var assigned = stationJobs.AssignJobs(profiles, new[] { station });
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(forcedProfile.JobPriorities.Keys, Does.Not.Contain(Captain));
+                Assert.That(assigned[forcedPlayer].Item1, Is.EqualTo(Captain));
+                Assert.That(assigned[forcedPlayer].Item2, Is.EqualTo(station));
+                Assert.That(assigned[competingPlayer].Item1, Is.EqualTo(Passenger));
+                Assert.That(assigned.Values.Count(value => value.Item1 == Captain), Is.EqualTo(1));
+            });
+        });
+    }
+
+    [Test]
+    public async Task ForcedRoundStartRoleReservesSlotForAbsentPlayer()
+    {
+        var setId = UniqueSetId();
+
+        await UseIsolatedWeeklyRoot();
+
+        await Server.WaitPost(() =>
+        {
+            var weekly = SEntMan.System<WeeklyModeSystem>();
+            var stationJobs = SEntMan.System<StationJobsSystem>();
+            StartWeeklySet(weekly, setId);
+
+            var absentPlayer = new NetUserId(Guid.NewGuid());
+            var competingPlayer = new NetUserId(Guid.NewGuid());
+            Assert.That(weekly.TryForceRole(setId, absentPlayer, "absent-captain", Captain, false, "integration-test", out var message),
+                Is.True,
+                message);
+
+            var station = CreateForcedRoleStation();
+            var profiles = new Dictionary<NetUserId, HumanoidCharacterProfile>
+            {
+                [competingPlayer] = HumanoidCharacterProfile.Random()
+                    .WithJobPriority(Captain, JobPriority.High)
+                    .WithJobPriority(Passenger, JobPriority.Medium),
+            };
+
+            var assigned = stationJobs.AssignJobs(profiles, new[] { station });
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(assigned.ContainsKey(absentPlayer), Is.False);
+                Assert.That(assigned[competingPlayer].Item1, Is.EqualTo(Passenger));
+                Assert.That(assigned.Values.Select(value => value.Item1), Does.Not.Contain(Captain));
+            });
+        });
+    }
+
+    [Test]
+    public async Task ForcedRoleConfigRejectsDisabledZeroLimitAndOverLimitJobs()
+    {
+        await UseIsolatedWeeklyRoot();
+
+        await Server.WaitPost(() =>
+        {
+            var weekly = SEntMan.System<WeeklyModeSystem>();
+            var disabledSetId = UniqueSetId();
+            StartWeeklySet(weekly, disabledSetId);
+
+            Assert.That(weekly.TryDisableRoles(disabledSetId, new[] { Captain.Id }, out var message), Is.True, message);
+            Assert.That(weekly.TryForceRole(disabledSetId, new NetUserId(Guid.NewGuid()), "disabled-captain", Captain, false, "integration-test", out message),
+                Is.False);
+            Assert.That(message, Does.Contain("disabled"));
+            Assert.That(weekly.TryStop(disabledSetId, out message), Is.True, message);
+
+            var zeroLimitSetId = UniqueSetId();
+            StartWeeklySet(weekly, zeroLimitSetId);
+            Assert.That(weekly.TrySetRoleLimit(zeroLimitSetId, Captain, 0, out message), Is.True, message);
+            Assert.That(weekly.TryForceRole(zeroLimitSetId, new NetUserId(Guid.NewGuid()), "zero-limit-captain", Captain, false, "integration-test", out message),
+                Is.False);
+            Assert.That(message, Does.Contain("limit is 0"));
+            Assert.That(weekly.TryStop(zeroLimitSetId, out message), Is.True, message);
+
+            var overLimitSetId = UniqueSetId();
+            StartWeeklySet(weekly, overLimitSetId);
+            Assert.That(weekly.TrySetRoleLimit(overLimitSetId, Captain, 1, out message), Is.True, message);
+            Assert.That(weekly.TryForceRole(overLimitSetId, new NetUserId(Guid.NewGuid()), "first-captain", Captain, false, "integration-test", out message),
+                Is.True,
+                message);
+            Assert.That(weekly.TryForceRole(overLimitSetId, new NetUserId(Guid.NewGuid()), "second-captain", Captain, false, "integration-test", out message),
+                Is.False);
+            Assert.Multiple(() =>
+            {
+                Assert.That(message, Does.Contain("exceed campaign role limit"));
+                Assert.That(weekly.ListForcedRoles(overLimitSetId), Does.Contain("first-captain"));
+                Assert.That(weekly.ListForcedRoles(overLimitSetId), Does.Not.Contain("second-captain"));
+            });
+        });
+    }
+
+    [Test]
+    public async Task ForcedRoleAssignmentPersistsAfterCampaignRestart()
+    {
+        var setId = UniqueSetId();
+
+        await UseIsolatedWeeklyRoot();
+
+        await Server.WaitPost(() =>
+        {
+            var weekly = SEntMan.System<WeeklyModeSystem>();
+            StartWeeklySet(weekly, setId);
+
+            var userId = new NetUserId(Guid.NewGuid());
+            Assert.That(weekly.TryForceRole(setId, userId, "persistent-captain", Captain, true, "integration-test", out var message),
+                Is.True,
+                message);
+            Assert.That(weekly.TryStop(setId, out message), Is.True, message);
+            Assert.That(weekly.TryStart(setId, null, "integration-test-restart", out message), Is.True, message);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(weekly.ListForcedRoles(setId), Does.Contain(userId.UserId.ToString()));
+                Assert.That(weekly.ListForcedRoles(setId), Does.Contain("persistent-captain"));
+                Assert.That(weekly.ListForcedRoles(setId), Does.Contain("Captain"));
+                Assert.That(weekly.ListForcedRoles(setId), Does.Contain("bypassPlaytime=True"));
+            });
+        });
+    }
+
     private async Task UseIsolatedWeeklyRoot()
     {
         await OverrideCVar(Side.Server, CCVars.WeeklyModeDataRoot, $"/weekly-mode-tests/{Guid.NewGuid():N}");
@@ -251,6 +490,12 @@ public sealed class WeeklyModeLiveEditingTest : GameTest
     {
         Assert.That(weekly.TryCreateSet(setId, EmptyMapPath, "Live edit test", out var message), Is.True, message);
         Assert.That(weekly.TryStart(setId, null, "integration-test", out message), Is.True, message);
+    }
+
+    private EntityUid CreateForcedRoleStation()
+    {
+        var prototype = Server.ResolveDependency<IPrototypeManager>().Index<GameMapPrototype>(ForcedRolesMapId);
+        return SEntMan.System<StationSystem>().InitializeNewStation(prototype.Stations["Station"], null, "Weekly forced role test");
     }
 
     private CargoConsoleFixture CreateCargoConsole()
@@ -268,6 +513,27 @@ public sealed class WeeklyModeLiveEditingTest : GameTest
         stationSystem.SetStation((console, tracker), station);
 
         return new CargoConsoleFixture(station, console, consoleComponent, orderDatabase);
+    }
+
+    private void PowerLathe(EntityUid uid)
+    {
+        if (!SEntMan.HasComponent<ApcPowerReceiverComponent>(uid))
+            return;
+
+        SEntMan.RemoveComponent<ApcPowerReceiverComponent>(uid);
+    }
+
+    private int CountEntitiesByPrototype(string prototypeId)
+    {
+        var count = 0;
+        var query = SEntMan.EntityQueryEnumerator<MetaDataComponent>();
+        while (query.MoveNext(out _, out var meta))
+        {
+            if (meta.EntityPrototype?.ID == prototypeId)
+                count++;
+        }
+
+        return count;
     }
 
     private void AssertCargoUiState(EntityUid consoleUid, string productId, string category, int cost, bool boxed, int amount)
@@ -305,6 +571,21 @@ public sealed class WeeklyModeLiveEditingTest : GameTest
 
     [TestPrototypes]
     private const string Prototypes = @"
+- type: gameMap
+  id: WeeklyForcedRoleStationMap
+  mapName: WeeklyForcedRoleStationMap
+  mapPath: /Maps/Test/empty.yml
+  minPlayers: 0
+  stations:
+    Station:
+      mapNameTemplate: Weekly forced role test
+      stationProto: StandardNanotrasenStation
+      components:
+        - type: StationJobs
+          availableJobs:
+            Passenger: [-1, -1]
+            Captain: [1, 1]
+
 - type: entity
   id: WeeklyLiveResearchDatabase
   components:

@@ -55,10 +55,11 @@ namespace Content.Client.Lathe.UI
             if (state is LatheUpdateState msg)
             {
                 _menu.Recipes = msg.Recipes;
+                _menu.WeeklyRecipes = msg.WeeklyRecipes;
                 _menu.PopulateRecipes();
                 _menu.UpdateCategories();
                 _menu.PopulateQueueList(msg.Queue);
-                _menu.SetQueueInfo(msg.CurrentlyProducing);
+                _menu.SetQueueInfo(msg.CurrentlyProducing, msg.CurrentlyProducingIsWeekly);
                 _menu.SetUseCardId(msg.UseCardId);
             }
         }

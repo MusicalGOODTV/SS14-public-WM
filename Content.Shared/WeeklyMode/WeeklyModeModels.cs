@@ -1,5 +1,8 @@
 
 
+using System.Text.Json.Serialization;
+using Robust.Shared.GameObjects;
+
 namespace Content.Shared.WeeklyMode;
 
 public enum WeeklySnapshotKind
@@ -44,7 +47,30 @@ public sealed class WeeklyModeSet
     public bool RandomGameRulesEnabled { get; set; }
     public List<WeeklyTechnologyEntry> WeeklyTechnologies { get; set; } = new();
     public List<WeeklyCargoProductEntry> WeeklyCargoProducts { get; set; } = new();
+    [JsonPropertyName("forcedRoleAssignments")]
+    public List<WeeklyForcedRoleAssignment> ForcedRoleAssignments { get; set; } = new();
     public Dictionary<string, string> CampaignState { get; set; } = new();
+}
+
+public sealed class WeeklyForcedRoleAssignment
+{
+    [JsonPropertyName("playerNetUserId")]
+    public string PlayerNetUserId { get; set; } = string.Empty;
+
+    [JsonPropertyName("lastKnownCKey")]
+    public string LastKnownCKey { get; set; } = string.Empty;
+
+    [JsonPropertyName("jobId")]
+    public string JobId { get; set; } = string.Empty;
+
+    [JsonPropertyName("createdBy")]
+    public string CreatedBy { get; set; } = string.Empty;
+
+    [JsonPropertyName("createdAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    [JsonPropertyName("bypassPlaytime")]
+    public bool BypassPlaytime { get; set; }
 }
 
 public sealed class WeeklyTechnologyEntry
@@ -65,6 +91,43 @@ public sealed class WeeklyCargoProductEntry
     public int Amount { get; set; } = 1;
     public string ItemPrototype { get; set; } = string.Empty;
 }
+
+public sealed class WeeklyRecipesConfig
+{
+    public const int CurrentSchemaVersion = 1;
+
+    [JsonPropertyName("schemaVersion")]
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+
+    [JsonPropertyName("recipes")]
+    public List<WeeklyRecipeDefinition> Recipes { get; set; } = new();
+}
+
+public sealed class WeeklyRecipeDefinition
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("resultPrototype")]
+    public string ResultPrototype { get; set; } = string.Empty;
+
+    [JsonPropertyName("resultAmount")]
+    public int ResultAmount { get; set; } = 1;
+
+    [JsonPropertyName("productionTimeSeconds")]
+    public double ProductionTimeSeconds { get; set; } = 5;
+
+    [JsonPropertyName("latheTargets")]
+    public List<string> LatheTargets { get; set; } = new();
+
+    [JsonPropertyName("materials")]
+    public Dictionary<string, int> Materials { get; set; } = new();
+
+    [JsonPropertyName("technologyIds")]
+    public List<string> TechnologyIds { get; set; } = new();
+}
+
+public sealed class WeeklyRecipesChangedEvent : EntityEventArgs;
 
 public sealed class WeeklyModeRuntimeState
 {

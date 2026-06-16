@@ -2,7 +2,9 @@ using System.Linq;
 using System.Globalization;
 using Content.Server.WeeklyMode.Systems;
 using Content.Shared.Administration;
+using Content.Shared.Lathe.Prototypes;
 using Content.Shared.Maps;
+using Content.Shared.Materials;
 using Content.Shared.Research.Prototypes;
 using Content.Shared.Roles;
 using Content.Shared.WeeklyMode;
@@ -574,6 +576,218 @@ public sealed class WmRolesLimitClearAllCommand : LocalizedEntityCommands
 }
 
 [AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRolesForceCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.roles.force";
+    public override string Description => "Forces a campaign job assignment for a specific account.";
+    public override string Help => "wm.roles.force <setId> <ckey-or-uuid> <jobId> [--bypass-playtime]";
+
+    public override async void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length is < 3 or > 4 ||
+            args.Length == 4 && args[3] != "--bypass-playtime")
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        var target = await _weekly.ResolveForcedRoleTargetAsync(args[1]);
+        if (!target.Success)
+        {
+            shell.WriteError(target.Message);
+            return;
+        }
+
+        var createdBy = shell.Player?.Name ?? "server console";
+        if (_weekly.TryForceRole(args[0], target.UserId, target.LastKnownCKey, args[2], args.Length == 4, createdBy, out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+
+    public override CompletionResult GetCompletion(IConsoleShell shell, string[] args)
+    {
+        return args.Length switch
+        {
+            1 => CompletionResult.FromHint("Set id"),
+            2 => CompletionResult.FromHint("CKey or UUID"),
+            3 => CompletionResult.FromHintOptions(CompletionHelper.PrototypeIDs<JobPrototype>(), "Job prototype"),
+            4 => CompletionResult.FromHintOptions(new[] { "--bypass-playtime" }, "Optional playtime bypass"),
+            _ => CompletionResult.Empty
+        };
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRolesForceUpdateCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.roles.force-update";
+    public override string Description => "Updates a campaign forced job assignment.";
+    public override string Help => "wm.roles.force-update <setId> <ckey-or-uuid> <newJobId> [--bypass-playtime|--no-bypass-playtime]";
+
+    public override async void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length is < 3 or > 4)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        bool? bypass = null;
+        if (args.Length == 4)
+        {
+            bypass = args[3] switch
+            {
+                "--bypass-playtime" => true,
+                "--no-bypass-playtime" => false,
+                _ => null,
+            };
+
+            if (bypass == null)
+            {
+                shell.WriteError(Help);
+                return;
+            }
+        }
+
+        var target = await _weekly.ResolveForcedRoleTargetAsync(args[1]);
+        if (!target.Success)
+        {
+            shell.WriteError(target.Message);
+            return;
+        }
+
+        var updatedBy = shell.Player?.Name ?? "server console";
+        if (_weekly.TryUpdateForcedRole(args[0], target.UserId, target.LastKnownCKey, args[2], updatedBy, bypass, out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+
+    public override CompletionResult GetCompletion(IConsoleShell shell, string[] args)
+    {
+        return args.Length switch
+        {
+            1 => CompletionResult.FromHint("Set id"),
+            2 => CompletionResult.FromHint("CKey or UUID"),
+            3 => CompletionResult.FromHintOptions(CompletionHelper.PrototypeIDs<JobPrototype>(), "Job prototype"),
+            4 => CompletionResult.FromHintOptions(new[] { "--bypass-playtime", "--no-bypass-playtime" }, "Optional playtime flag"),
+            _ => CompletionResult.Empty
+        };
+    }
+}
+
+[AdminCommand(AdminFlags.Round)]
+public sealed class WmRolesForceListCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.roles.force-list";
+    public override string Description => "Lists campaign forced job assignments.";
+    public override string Help => "wm.roles.force-list <setId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 1)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        shell.WriteLine(_weekly.ListForcedRoles(args[0]));
+    }
+}
+
+[AdminCommand(AdminFlags.Round)]
+public sealed class WmRolesForceShowCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.roles.force-show";
+    public override string Description => "Shows one campaign forced job assignment.";
+    public override string Help => "wm.roles.force-show <setId> <ckey-or-uuid>";
+
+    public override async void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 2)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        var target = await _weekly.ResolveForcedRoleTargetAsync(args[1]);
+        if (!target.Success)
+        {
+            shell.WriteError(target.Message);
+            return;
+        }
+
+        shell.WriteLine(_weekly.ShowForcedRole(args[0], target.UserId, args[1]));
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRolesForceClearCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.roles.force-clear";
+    public override string Description => "Clears one campaign forced job assignment.";
+    public override string Help => "wm.roles.force-clear <setId> <ckey-or-uuid>";
+
+    public override async void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 2)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        var target = await _weekly.ResolveForcedRoleTargetAsync(args[1]);
+        if (!target.Success)
+        {
+            shell.WriteError(target.Message);
+            return;
+        }
+
+        var removedBy = shell.Player?.Name ?? "server console";
+        if (_weekly.TryClearForcedRole(args[0], target.UserId, args[1], removedBy, out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRolesForceClearAllCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.roles.force-clear-all";
+    public override string Description => "Clears all campaign forced job assignments.";
+    public override string Help => "wm.roles.force-clear-all <setId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 1)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        var removedBy = shell.Player?.Name ?? "server console";
+        if (_weekly.TryClearAllForcedRoles(args[0], removedBy, out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
 public sealed class WmAutosaveSetCommand : LocalizedEntityCommands
 {
     [Dependency] private readonly WeeklyModeSystem _weekly = default!;
@@ -983,6 +1197,288 @@ public sealed class WmTechValidateCommand : LocalizedEntityCommands
         }
 
         shell.WriteLine(_weekly.ValidateTechnologies(args[0]));
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe";
+    public override string Description => "Adds a campaign-only weekly lathe recipe.";
+    public override string Help => "wm.recipe <setId> add <recipeId> <resultPrototype> <resultAmount> <productionTimeSeconds> <latheTargets> <materialId:amount> [materialId:amount ...]";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length < 8 ||
+            !string.Equals(args[1], "add", StringComparison.OrdinalIgnoreCase) ||
+            !int.TryParse(args[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var resultAmount) ||
+            !double.TryParse(args[5], NumberStyles.Float, CultureInfo.InvariantCulture, out var productionTimeSeconds))
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryAddRecipe(args[0], args[2], args[3], resultAmount, productionTimeSeconds, args[6], args.Skip(7).ToArray(), out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+
+    public override CompletionResult GetCompletion(IConsoleShell shell, string[] args)
+    {
+        return args.Length switch
+        {
+            2 => CompletionResult.FromHintOptions(new[] { "add" }, "Action"),
+            4 => CompletionResult.FromHintOptions(CompletionHelper.PrototypeIDs<EntityPrototype>(), "Result entity prototype"),
+            7 => CompletionResult.FromHintOptions(new[] { "protolathe", "security", "medical", "engineering", "service", "science", "cargo", "civilian", "all" }, "Lathe targets"),
+            _ => CompletionResult.Empty
+        };
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeUpdateCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.update";
+    public override string Description => "Updates a campaign-only weekly lathe recipe.";
+    public override string Help => "wm.recipe.update <setId> <recipeId> <result|time|targets|materials> <args...>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length < 4)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryUpdateRecipe(args[0], args[1], args[2], args.Skip(3).ToArray(), out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+
+    public override CompletionResult GetCompletion(IConsoleShell shell, string[] args)
+    {
+        return args.Length switch
+        {
+            3 => CompletionResult.FromHintOptions(new[] { "result", "time", "targets", "materials" }, "Field"),
+            4 when args.Length >= 3 && string.Equals(args[2], "result", StringComparison.OrdinalIgnoreCase) =>
+                CompletionResult.FromHintOptions(CompletionHelper.PrototypeIDs<EntityPrototype>(), "Result entity prototype"),
+            4 when args.Length >= 3 && string.Equals(args[2], "targets", StringComparison.OrdinalIgnoreCase) =>
+                CompletionResult.FromHintOptions(new[] { "protolathe", "security", "medical", "engineering", "service", "science", "cargo", "civilian", "all" }, "Lathe targets"),
+            _ => CompletionResult.Empty
+        };
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeTargetAddCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.target-add";
+    public override string Description => "Adds a target to a campaign-only weekly recipe.";
+    public override string Help => "wm.recipe.target-add <setId> <recipeId> <latheTarget>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 3)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryAddRecipeTarget(args[0], args[1], args[2], out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeTargetRemoveCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.target-remove";
+    public override string Description => "Removes a target from a campaign-only weekly recipe.";
+    public override string Help => "wm.recipe.target-remove <setId> <recipeId> <latheTarget>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 3)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryRemoveRecipeTarget(args[0], args[1], args[2], out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeLinkCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.link";
+    public override string Description => "Links a campaign-only weekly recipe to a weekly technology.";
+    public override string Help => "wm.recipe.link <setId> <recipeId> <technologyId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 3)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryLinkRecipe(args[0], args[1], args[2], out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeUnlinkCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.unlink";
+    public override string Description => "Unlinks a campaign-only weekly recipe from a weekly technology.";
+    public override string Help => "wm.recipe.unlink <setId> <recipeId> <technologyId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 3)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryUnlinkRecipe(args[0], args[1], args[2], out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round)]
+public sealed class WmRecipeListCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.list";
+    public override string Description => "Lists campaign-only weekly recipes.";
+    public override string Help => "wm.recipe.list <setId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 1)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        shell.WriteLine(_weekly.ListRecipes(args[0]));
+    }
+}
+
+[AdminCommand(AdminFlags.Round)]
+public sealed class WmRecipeShowCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.show";
+    public override string Description => "Shows a campaign-only weekly recipe.";
+    public override string Help => "wm.recipe.show <setId> <recipeId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 2)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        shell.WriteLine(_weekly.ShowRecipe(args[0], args[1]));
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeRemoveCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.remove";
+    public override string Description => "Removes a campaign-only weekly recipe.";
+    public override string Help => "wm.recipe.remove <setId> <recipeId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 2)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryRemoveRecipe(args[0], args[1], out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
+    }
+}
+
+[AdminCommand(AdminFlags.Round)]
+public sealed class WmRecipeValidateCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.validate";
+    public override string Description => "Validates campaign-only weekly recipes.";
+    public override string Help => "wm.recipe.validate <setId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 1)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        shell.WriteLine(_weekly.ValidateRecipes(args[0]));
+    }
+}
+
+[AdminCommand(AdminFlags.Round | AdminFlags.Server)]
+public sealed class WmRecipeClearCommand : LocalizedEntityCommands
+{
+    [Dependency] private readonly WeeklyModeSystem _weekly = default!;
+
+    public override string Command => "wm.recipe.clear";
+    public override string Description => "Clears all campaign-only weekly recipes.";
+    public override string Help => "wm.recipe.clear <setId>";
+
+    public override void Execute(IConsoleShell shell, string argStr, string[] args)
+    {
+        if (args.Length != 1)
+        {
+            shell.WriteError(Help);
+            return;
+        }
+
+        if (_weekly.TryClearRecipes(args[0], out var message))
+            shell.WriteLine(message);
+        else
+            shell.WriteError(message);
     }
 }
 

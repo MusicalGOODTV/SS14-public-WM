@@ -3,6 +3,9 @@ using System.Globalization;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Threading.Tasks;
+using Content.Server.Administration;
+using Content.Server.Administration.Managers;
 using Content.Server.Cargo.Systems;
 using Content.Server.Chemistry.Components;
 using Content.Server.Chat.Managers;
@@ -29,11 +32,14 @@ using Content.Shared.GameTicking;
 using Content.Shared.Ghost;
 using Content.Shared.Light.Components;
 using Content.Shared.Lathe;
+using Content.Shared.Lathe.Prototypes;
 using Content.Shared.Maps;
+using Content.Shared.Materials;
 using Content.Shared.Mind;
 using Content.Shared.Mind.Components;
 using Content.Shared.Mobs.Components;
 using Content.Shared.Players.PlayTimeTracking;
+using Content.Shared.Preferences;
 using Content.Shared.Research;
 using Content.Shared.Research.Components;
 using Content.Shared.Research.Prototypes;
@@ -80,6 +86,8 @@ public sealed class WeeklyModeSystem : EntitySystem
         None = 0,
         Research = 1,
         Cargo = 2,
+        Recipes = 4,
+        Roles = 8,
     }
 
     [Dependency] private readonly IConfigurationManager _cfg = default!;
@@ -103,12 +111,15 @@ public sealed class WeeklyModeSystem : EntitySystem
     [Dependency] private readonly ResearchSystem _research = default!;
     [Dependency] private readonly SharedBorgSystem _borg = default!;
     [Dependency] private readonly SharedMindSystem _mind = default!;
+    [Dependency] private readonly IPlayerLocator _playerLocator = default!;
+    [Dependency] private readonly IBanManager _banManager = default!;
 
     private readonly WeeklyModeRuntimeState _state = new();
     private readonly Dictionary<EntityUid, Dictionary<string, int?>> _originalSlots = new();
     private readonly Dictionary<string, RollbackConfirmation> _rollbackConfirmations = new();
     private readonly HashSet<NetUserId> _accessLobbyNoticeSent = new();
     private readonly Dictionary<NetUserId, TimeSpan> _accessNoticeCooldowns = new();
+    private readonly Dictionary<NetUserId, TimeSpan> _forcedRoleNoticeCooldowns = new();
 
     private EntityQuery<TransformComponent> _xformQuery;
     private EntityQuery<MetaDataComponent> _metaQuery;
@@ -177,6 +188,21 @@ public sealed class WeeklyModeSystem : EntitySystem
         ["service"] = "CivilianServices",
     };
 
+    private sealed record WeeklyRecipeTargetAlias(string[] Entities, string[] Packs, bool All = false);
+
+    private static readonly Dictionary<string, WeeklyRecipeTargetAlias> WeeklyRecipeTargetAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["protolathe"] = new(new[] { "Protolathe", "ProtolatheHyperConvection" }, Array.Empty<string>()),
+        ["security"] = new(new[] { "SecurityTechFab", "AmmoTechFab" }, Array.Empty<string>()),
+        ["medical"] = new(new[] { "MedicalTechFab" }, Array.Empty<string>()),
+        ["engineering"] = new(new[] { "Protolathe", "ProtolatheHyperConvection", "CircuitImprinter", "CircuitImprinterHyperConvection" }, Array.Empty<string>()),
+        ["service"] = new(new[] { "Autolathe", "AutolatheHyperConvection", "Protolathe", "ProtolatheHyperConvection", "CircuitImprinter", "CircuitImprinterHyperConvection", "UniformPrinter" }, Array.Empty<string>()),
+        ["science"] = new(new[] { "Protolathe", "ProtolatheHyperConvection", "CircuitImprinter", "CircuitImprinterHyperConvection", "ExosuitFabricator" }, Array.Empty<string>()),
+        ["cargo"] = new(new[] { "Autolathe", "AutolatheHyperConvection", "CircuitImprinter", "CircuitImprinterHyperConvection" }, Array.Empty<string>()),
+        ["civilian"] = new(new[] { "Autolathe", "AutolatheHyperConvection", "UniformPrinter" }, Array.Empty<string>()),
+        ["all"] = new(Array.Empty<string>(), Array.Empty<string>(), true),
+    };
+
     public override void Initialize()
     {
         base.Initialize();
@@ -204,6 +230,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         SubscribeLocalEvent<PostGameMapLoad>(OnPostGameMapLoad);
         SubscribeLocalEvent<StationInitializedEvent>(OnStationInitialized);
         SubscribeLocalEvent<RoundStartedEvent>(OnRoundStarted);
+        SubscribeLocalEvent<TechnologyDatabaseComponent, ComponentStartup>(OnTechnologyDatabaseStartup);
         SubscribeLocalEvent<PlayerJoinedLobbyEvent>(OnPlayerJoinedLobby);
         SubscribeLocalEvent<StationJobsGetCandidatesEvent>(OnStationJobsGetCandidates);
         SubscribeLocalEvent<IsRoleAllowedEvent>(OnIsRoleAllowed);
@@ -833,6 +860,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             }
         }
 
+        var originalSet = CloneSet(set);
         var added = new List<string>();
         foreach (var jobId in jobIds.Distinct(StringComparer.Ordinal))
         {
@@ -844,7 +872,8 @@ public sealed class WeeklyModeSystem : EntitySystem
         }
 
         set.DefaultDisabledJobs.Sort(StringComparer.Ordinal);
-        _store.SaveSet(set);
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Roles, out message))
+            return false;
 
         message = added.Count == 0
             ? $"No role changes were needed for set '{set.SetId}'."
@@ -1027,8 +1056,11 @@ public sealed class WeeklyModeSystem : EntitySystem
             return false;
         }
 
+        var originalSet = CloneSet(set);
         set.DefaultRoleLimits[jobId] = count;
-        _store.SaveSet(set);
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Roles, out message))
+            return false;
+
         message = $"Set role limit for '{jobId}' to {count} in weekly set '{set.SetId}'.";
         return true;
     }
@@ -1082,6 +1114,610 @@ public sealed class WeeklyModeSystem : EntitySystem
             ? $"Weekly set '{set.SetId}' had no role limits."
             : $"Cleared {removed} role limits for weekly set '{set.SetId}'.";
         return true;
+    }
+
+    public bool TryForceRole(
+        string setId,
+        NetUserId userId,
+        string lastKnownCKey,
+        string jobId,
+        bool bypassPlaytime,
+        string createdBy,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!TryValidateForcedRoleJob(set, jobId, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+        var existing = set.ForcedRoleAssignments.FirstOrDefault(assignment => IsForcedAssignmentFor(assignment, userId));
+        if (existing != null)
+        {
+            existing.JobId = jobId;
+            existing.LastKnownCKey = lastKnownCKey;
+            existing.BypassPlaytime = bypassPlaytime;
+            existing.CreatedBy = createdBy;
+            existing.CreatedAt = DateTime.UtcNow;
+        }
+        else
+        {
+            set.ForcedRoleAssignments.Add(new WeeklyForcedRoleAssignment
+            {
+                PlayerNetUserId = userId.UserId.ToString(),
+                LastKnownCKey = lastKnownCKey,
+                JobId = jobId,
+                CreatedBy = createdBy,
+                CreatedAt = DateTime.UtcNow,
+                BypassPlaytime = bypassPlaytime,
+            });
+        }
+
+        SortForcedRoleAssignments(set);
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Roles, out message))
+            return false;
+
+        message = existing == null
+            ? $"Forced role assignment saved: {lastKnownCKey} [{userId}] -> {jobId} (bypassPlaytime={bypassPlaytime})."
+            : $"Forced role assignment updated: {lastKnownCKey} [{userId}] -> {jobId} (bypassPlaytime={bypassPlaytime}).";
+
+        if (IsActiveSet(set.SetId) && _gameTicker.UserHasJoinedGame(userId))
+            message += $"\nPlayer is already spawned. The new {jobId} assignment will apply on the next valid job assignment.";
+
+        _sawmill.Info($"Admin {createdBy} forced account {lastKnownCKey} ({userId}) to job {jobId} in campaign {set.SetId}. bypassPlaytime={bypassPlaytime}");
+        return true;
+    }
+
+    public bool TryUpdateForcedRole(
+        string setId,
+        NetUserId userId,
+        string lastKnownCKey,
+        string jobId,
+        string updatedBy,
+        bool? bypassPlaytime,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (!TryValidateForcedRoleJob(set, jobId, out message))
+            return false;
+
+        var assignment = set.ForcedRoleAssignments.FirstOrDefault(assignment => IsForcedAssignmentFor(assignment, userId));
+        if (assignment == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no forced role assignment for '{lastKnownCKey}'.";
+            return false;
+        }
+
+        var originalSet = CloneSet(set);
+        assignment.JobId = jobId;
+        assignment.LastKnownCKey = lastKnownCKey;
+        assignment.CreatedBy = updatedBy;
+        assignment.CreatedAt = DateTime.UtcNow;
+        if (bypassPlaytime != null)
+            assignment.BypassPlaytime = bypassPlaytime.Value;
+
+        SortForcedRoleAssignments(set);
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Roles, out message))
+            return false;
+
+        message = $"Forced role assignment updated: {lastKnownCKey} [{userId}] -> {jobId} (bypassPlaytime={assignment.BypassPlaytime}).";
+        if (IsActiveSet(set.SetId) && _gameTicker.UserHasJoinedGame(userId))
+            message += $"\nPlayer is already spawned. The new {jobId} assignment will apply on the next valid job assignment.";
+
+        _sawmill.Info($"Admin {updatedBy} updated forced role assignment for account {lastKnownCKey} ({userId}) to job {jobId} in campaign {set.SetId}. bypassPlaytime={assignment.BypassPlaytime}");
+        return true;
+    }
+
+    public string ListForcedRoles(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        if (set.ForcedRoleAssignments.Count == 0)
+            return $"Weekly set '{set.SetId}' has no forced role assignments.";
+
+        var lines = new List<string> { $"Forced role assignments for {set.SetId}:" };
+        foreach (var assignment in set.ForcedRoleAssignments.OrderBy(assignment => assignment.LastKnownCKey, StringComparer.OrdinalIgnoreCase))
+        {
+            lines.Add($"- {FormatForcedRoleAssignment(assignment)}");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    public string ShowForcedRole(string setId, NetUserId userId, string playerNameOrId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var assignment = set.ForcedRoleAssignments.FirstOrDefault(assignment => IsForcedAssignmentFor(assignment, userId));
+        return assignment == null
+            ? $"Weekly set '{set.SetId}' has no forced role assignment for '{playerNameOrId}'."
+            : FormatForcedRoleAssignment(assignment);
+    }
+
+    public bool TryClearForcedRole(string setId, NetUserId userId, string playerNameOrId, string removedBy, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var originalSet = CloneSet(set);
+        var removed = set.ForcedRoleAssignments.RemoveAll(assignment => IsForcedAssignmentFor(assignment, userId));
+        if (removed == 0)
+        {
+            message = $"Weekly set '{set.SetId}' had no forced role assignment for '{playerNameOrId}'.";
+            return true;
+        }
+
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Roles, out message))
+            return false;
+
+        message = $"Cleared forced role assignment for {playerNameOrId} [{userId}] in weekly set '{set.SetId}'.";
+        _sawmill.Info($"Admin {removedBy} cleared forced role assignment for account {playerNameOrId} ({userId}) in campaign {set.SetId}.");
+        return true;
+    }
+
+    public bool TryClearAllForcedRoles(string setId, string removedBy, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var removed = set.ForcedRoleAssignments.Count;
+        if (removed == 0)
+        {
+            message = $"Weekly set '{set.SetId}' had no forced role assignments.";
+            return true;
+        }
+
+        var originalSet = CloneSet(set);
+        set.ForcedRoleAssignments.Clear();
+        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Roles, out message))
+            return false;
+
+        message = $"Cleared {removed} forced role assignments for weekly set '{set.SetId}'.";
+        _sawmill.Info($"Admin {removedBy} cleared all forced role assignments in campaign {set.SetId}.");
+        return true;
+    }
+
+    public async Task<(bool Success, NetUserId UserId, string LastKnownCKey, string Message)> ResolveForcedRoleTargetAsync(string playerNameOrId)
+    {
+        if (Guid.TryParse(playerNameOrId, out var guid))
+        {
+            var userId = new NetUserId(guid);
+            var located = await _playerLocator.LookupIdAsync(userId);
+            return (true, userId, located?.Username ?? userId.UserId.ToString(), string.Empty);
+        }
+
+        var data = await _playerLocator.LookupIdByNameAsync(playerNameOrId);
+        if (data == null)
+        {
+            return (false,
+                new NetUserId(Guid.Empty),
+                string.Empty,
+                $"Could not resolve '{playerNameOrId}' to a stable NetUserId. Use an online/current CKey, a known offline account name, or a UUID.");
+        }
+
+        return (true, data.UserId, data.Username, string.Empty);
+    }
+
+    public void ApplyForcedRoundStartAssignments(
+        Dictionary<NetUserId, HumanoidCharacterProfile> profiles,
+        IReadOnlyList<EntityUid> stations,
+        Dictionary<EntityUid, Dictionary<ProtoId<JobPrototype>, int?>> stationJobs,
+        Dictionary<NetUserId, (ProtoId<JobPrototype>?, EntityUid)> assigned)
+    {
+        var set = LoadActiveSetOrNull();
+        if (set == null || set.ForcedRoleAssignments.Count == 0)
+            return;
+
+        foreach (var assignment in set.ForcedRoleAssignments.OrderBy(assignment => assignment.JobId, StringComparer.Ordinal))
+        {
+            if (!TryParseForcedRoleAssignment(assignment, out var userId, out var jobId, out var error))
+            {
+                _sawmill.Warning($"Weekly forced role assignment failed: campaign={set.SetId} reason={error}");
+                continue;
+            }
+
+            if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+            {
+                _sawmill.Warning($"Weekly forced role assignment failed: campaign={set.SetId} player={assignment.LastKnownCKey} job={jobId} reason=unknown job");
+                continue;
+            }
+
+            var hasReadyProfile = profiles.ContainsKey(userId);
+            if (hasReadyProfile)
+                profiles.Remove(userId);
+
+            if (!TryReserveForcedRoundStartSlot(stations, stationJobs, jobId, out var station))
+            {
+                _sawmill.Warning($"Weekly forced role assignment failed: campaign={set.SetId} player={assignment.LastKnownCKey} userId={userId} job={jobId} reason=no slot to reserve");
+                continue;
+            }
+
+            if (!hasReadyProfile)
+                continue;
+
+            if (_banManager.GetJobBans(userId)?.Contains(jobId) == true)
+            {
+                _sawmill.Warning($"Weekly forced role assignment failed: campaign={set.SetId} player={assignment.LastKnownCKey} userId={userId} job={jobId} reason=job ban");
+                continue;
+            }
+
+            if (_playerManager.TryGetSessionById(userId, out var session) &&
+                !IsWeeklyAccessAllowedForAssignment(session, set, assignment, true))
+            {
+                _sawmill.Warning($"Weekly forced role assignment failed: campaign={set.SetId} player={assignment.LastKnownCKey} userId={userId} job={jobId} reason=playtime gate");
+                continue;
+            }
+
+            assigned[userId] = (jobId, station);
+            _sawmill.Info($"Weekly forced role assigned: campaign={set.SetId} player={assignment.LastKnownCKey} userId={userId} job={jobId} station={ToPrettyString(station)}");
+        }
+    }
+
+    public bool TryGetForcedLateJoinJob(
+        ICommonSession session,
+        EntityUid station,
+        IReadOnlySet<ProtoId<JobPrototype>> restrictedRoles,
+        [NotNullWhen(true)] out ProtoId<JobPrototype>? jobId,
+        out string? message)
+    {
+        jobId = null;
+        message = null;
+
+        if (!TryGetActiveForcedAssignment(session.UserId, out var set, out var assignment))
+            return false;
+
+        if (_gameTicker.UserHasJoinedGame(session.UserId))
+            return false;
+
+        if (!TryParseForcedRoleAssignment(assignment, out _, out var forcedJob, out var error))
+        {
+            message = error;
+            return false;
+        }
+
+        if (restrictedRoles.Contains(forcedJob) || _banManager.GetJobBans(session.UserId)?.Contains(forcedJob) == true)
+        {
+            message = $"Your reserved weekly role '{forcedJob}' is currently blocked.";
+            _sawmill.Warning($"Weekly forced role assignment failed: campaign={set.SetId} player={assignment.LastKnownCKey} userId={session.UserId} job={forcedJob} reason=job blocked");
+            return false;
+        }
+
+        if (!IsWeeklyAccessAllowedForAssignment(session, set, assignment, true))
+        {
+            message = $"Your reserved weekly role '{forcedJob}' requires more playtime.";
+            return false;
+        }
+
+        if (!CanUseForcedLateJoinSlot(session.UserId, station, forcedJob, out message))
+            return false;
+
+        jobId = forcedJob;
+        NotifyForcedRole(session, set, assignment, true);
+        return true;
+    }
+
+    public bool CanLateJoinJob(ICommonSession session, EntityUid station, ProtoId<JobPrototype> jobId, [NotNullWhen(false)] out string? message)
+    {
+        message = null;
+
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return true;
+
+        if (!TryGetActiveForcedAssignment(session.UserId, out var set, out var ownAssignment))
+        {
+            if (IsJobFullyReservedForOthers(jobId))
+            {
+                message = $"{GetJobDisplayName(jobId)} is reserved by the active Weekly campaign.";
+                return false;
+            }
+
+            return true;
+        }
+
+        if (!TryParseForcedRoleAssignment(ownAssignment, out _, out var forcedJob, out var error))
+        {
+            message = error;
+            return false;
+        }
+
+        if (!string.Equals(forcedJob.Id, jobId.Id, StringComparison.Ordinal))
+        {
+            message = $"Your active Weekly campaign assignment is {GetJobDisplayName(forcedJob)}.";
+            return false;
+        }
+
+        if (_banManager.GetJobBans(session.UserId)?.Contains(forcedJob) == true)
+        {
+            message = $"{GetJobDisplayName(forcedJob)} is blocked for your account.";
+            return false;
+        }
+
+        if (!IsWeeklyAccessAllowedForAssignment(session, set, ownAssignment, true))
+        {
+            message = $"{GetJobDisplayName(forcedJob)} is reserved for you, but the Weekly playtime requirement is not met.";
+            return false;
+        }
+
+        return CanUseForcedLateJoinSlot(session.UserId, station, forcedJob, out message);
+    }
+
+    public bool HasForcedPlaytimeBypass(NetUserId userId)
+    {
+        return TryGetActiveForcedAssignment(userId, out _, out var assignment) && assignment.BypassPlaytime;
+    }
+
+    public bool IsWeeklyAccessAllowedForJob(ICommonSession session, string? jobId, bool notify)
+    {
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return true;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
+            return true;
+
+        if (IsWeeklyAccessAllowed(session, set, false))
+            return true;
+
+        if (jobId != null &&
+            TryGetForcedAssignment(set, session.UserId, out var assignment) &&
+            assignment.BypassPlaytime &&
+            string.Equals(assignment.JobId, jobId, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (notify)
+            SendAccessDeniedNotice(session, set, false);
+
+        return false;
+    }
+
+    private bool TryValidateForcedRoleJob(WeeklyModeSet set, string jobId, out string message)
+    {
+        if (!_prototype.TryIndex<JobPrototype>(jobId, out _))
+        {
+            message = $"Unknown job prototype '{jobId}'.";
+            return false;
+        }
+
+        if (set.DefaultDisabledJobs.Contains(jobId))
+        {
+            message = $"Cannot force role {jobId}: campaign role is disabled.";
+            return false;
+        }
+
+        if (set.DefaultRoleLimits.TryGetValue(jobId, out var limit) && limit == 0)
+        {
+            message = $"Cannot force role {jobId}:\ncampaign role limit is 0.";
+            return false;
+        }
+
+        message = string.Empty;
+        return true;
+    }
+
+    private static bool IsForcedAssignmentFor(WeeklyForcedRoleAssignment assignment, NetUserId userId)
+    {
+        return Guid.TryParse(assignment.PlayerNetUserId, out var guid) && guid == userId.UserId;
+    }
+
+    private static bool TryParseForcedRoleAssignment(
+        WeeklyForcedRoleAssignment assignment,
+        out NetUserId userId,
+        out ProtoId<JobPrototype> jobId,
+        out string message)
+    {
+        jobId = new ProtoId<JobPrototype>(assignment.JobId);
+        if (!Guid.TryParse(assignment.PlayerNetUserId, out var guid))
+        {
+            userId = new NetUserId(Guid.Empty);
+            message = $"invalid playerNetUserId '{assignment.PlayerNetUserId}'";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(assignment.JobId))
+        {
+            userId = new NetUserId(guid);
+            message = "empty forced jobId";
+            return false;
+        }
+
+        userId = new NetUserId(guid);
+        message = string.Empty;
+        return true;
+    }
+
+    private static void SortForcedRoleAssignments(WeeklyModeSet set)
+    {
+        set.ForcedRoleAssignments.Sort((a, b) =>
+        {
+            var name = string.Compare(a.LastKnownCKey, b.LastKnownCKey, StringComparison.OrdinalIgnoreCase);
+            return name != 0
+                ? name
+                : string.Compare(a.PlayerNetUserId, b.PlayerNetUserId, StringComparison.Ordinal);
+        });
+    }
+
+    private string FormatForcedRoleAssignment(WeeklyForcedRoleAssignment assignment)
+    {
+        var roleName = _prototype.TryIndex<JobPrototype>(assignment.JobId, out var job)
+            ? GetRoleDisplayName(job.ID, job.LocalizedName)
+            : assignment.JobId;
+
+        return $"{assignment.LastKnownCKey} [{assignment.PlayerNetUserId}] -> {assignment.JobId} ({roleName}) bypassPlaytime={assignment.BypassPlaytime} createdBy={assignment.CreatedBy} createdAt={assignment.CreatedAt:O}";
+    }
+
+    private bool TryGetActiveForcedAssignment(
+        NetUserId userId,
+        [NotNullWhen(true)] out WeeklyModeSet? set,
+        [NotNullWhen(true)] out WeeklyForcedRoleAssignment? assignment)
+    {
+        set = null;
+        assignment = null;
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return false;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out set))
+            return false;
+
+        return TryGetForcedAssignment(set, userId, out assignment);
+    }
+
+    private static bool TryGetForcedAssignment(
+        WeeklyModeSet set,
+        NetUserId userId,
+        [NotNullWhen(true)] out WeeklyForcedRoleAssignment? assignment)
+    {
+        assignment = set.ForcedRoleAssignments.FirstOrDefault(assignment => IsForcedAssignmentFor(assignment, userId));
+        return assignment != null;
+    }
+
+    private bool TryReserveForcedRoundStartSlot(
+        IReadOnlyList<EntityUid> stations,
+        Dictionary<EntityUid, Dictionary<ProtoId<JobPrototype>, int?>> stationJobs,
+        ProtoId<JobPrototype> jobId,
+        out EntityUid station)
+    {
+        station = EntityUid.Invalid;
+        foreach (var candidate in stations)
+        {
+            if (!stationJobs.TryGetValue(candidate, out var jobs) ||
+                !jobs.TryGetValue(jobId, out var slots))
+            {
+                continue;
+            }
+
+            station = candidate;
+            if (slots == null)
+                return true;
+
+            if (slots <= 0)
+                continue;
+
+            jobs[jobId] = slots.Value - 1;
+            return true;
+        }
+
+        station = EntityUid.Invalid;
+        return false;
+    }
+
+    private bool CanUseForcedLateJoinSlot(NetUserId userId, EntityUid station, ProtoId<JobPrototype> jobId, [NotNullWhen(false)] out string? message)
+    {
+        message = null;
+        if (station == EntityUid.Invalid)
+            return true;
+
+        if (!_stationJobs.TryGetJobSlot(station, jobId, out var slots))
+        {
+            message = $"{GetJobDisplayName(jobId)} is not available on the selected station.";
+            return false;
+        }
+
+        if (slots == null)
+            return true;
+
+        if (slots.Value > 0)
+            return true;
+
+        if (TryGetActiveForcedAssignment(userId, out _, out var assignment) &&
+            string.Equals(assignment.JobId, jobId.Id, StringComparison.Ordinal))
+        {
+            message = $"{GetJobDisplayName(jobId)} is reserved for you, but no station slot is currently available.";
+            return false;
+        }
+
+        message = $"{GetJobDisplayName(jobId)} has no available slots.";
+        return false;
+    }
+
+    private bool IsJobFullyReservedForOthers(ProtoId<JobPrototype> jobId)
+    {
+        var set = LoadActiveSetOrNull();
+        if (set == null)
+            return false;
+
+        var reservations = CountUnsatisfiedForcedReservations(set, jobId);
+        if (reservations <= 0)
+            return false;
+
+        var availableSlots = CountCurrentAvailableSlots(jobId);
+        return availableSlots != null && availableSlots.Value <= reservations;
+    }
+
+    private int CountUnsatisfiedForcedReservations(WeeklyModeSet set, ProtoId<JobPrototype> jobId)
+    {
+        var count = 0;
+        foreach (var assignment in set.ForcedRoleAssignments)
+        {
+            if (!string.Equals(assignment.JobId, jobId.Id, StringComparison.Ordinal))
+                continue;
+
+            if (!TryParseForcedRoleAssignment(assignment, out var userId, out _, out _))
+                continue;
+
+            if (_gameTicker.UserHasJoinedGame(userId))
+                continue;
+
+            count++;
+        }
+
+        return count;
+    }
+
+    private int? CountCurrentAvailableSlots(ProtoId<JobPrototype> jobId)
+    {
+        var total = 0;
+        var sawFinite = false;
+        var query = EntityQueryEnumerator<StationJobsComponent>();
+        while (query.MoveNext(out var station, out _))
+        {
+            if (!_stationJobs.TryGetJobSlot(station, jobId, out var slots))
+                continue;
+
+            if (slots == null)
+                return null;
+
+            sawFinite = true;
+            total += slots.Value;
+        }
+
+        return sawFinite ? total : 0;
+    }
+
+    private bool IsWeeklyAccessAllowedForAssignment(
+        ICommonSession session,
+        WeeklyModeSet set,
+        WeeklyForcedRoleAssignment assignment,
+        bool notify)
+    {
+        if (assignment.BypassPlaytime)
+            return true;
+
+        return IsWeeklyAccessAllowed(session, set, notify);
+    }
+
+    private void NotifyForcedRole(ICommonSession session, WeeklyModeSet set, WeeklyForcedRoleAssignment assignment, bool lateJoin)
+    {
+        if (_forcedRoleNoticeCooldowns.TryGetValue(session.UserId, out var nextAllowed) &&
+            _timing.CurTime < nextAllowed)
+        {
+            return;
+        }
+
+        _forcedRoleNoticeCooldowns[session.UserId] = _timing.CurTime + TimeSpan.FromSeconds(30);
+        var roleName = GetJobDisplayName(new ProtoId<JobPrototype>(assignment.JobId));
+        var text = lateJoin
+            ? $"Для вас зарезервирована роль: {roleName}."
+            : $"Для текущей Weekly-кампании вам гарантированно назначена роль:\n\n{roleName}\n\nЭта роль зарезервирована за вашим аккаунтом и будет выдана независимо от настроек приоритетов ролей.";
+
+        _chatManager.DispatchServerMessage(session, text);
     }
 
     public bool TrySetAutosave(string setId, int intervalMinutes, int warningMinutes, out string message)
@@ -1296,13 +1932,16 @@ public sealed class WeeklyModeSystem : EntitySystem
             return false;
         }
 
+        var recipeConfig = _store.LoadRecipesOrDefault(set.SetId);
+        var weeklyRecipeIds = recipeConfig.Recipes.Select(recipe => recipe.Id).ToHashSet(StringComparer.Ordinal);
         var recipes = new List<string>();
         foreach (var rawRecipe in recipeIds)
         {
             var recipeId = rawRecipe.Trim();
-            if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _))
+            if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _) &&
+                !weeklyRecipeIds.Contains(recipeId))
             {
-                message = $"Unknown lathe recipe prototype '{recipeId}'. No technology was changed.";
+                message = $"Unknown lathe or weekly recipe '{recipeId}'. No technology was changed.";
                 return false;
             }
 
@@ -1321,7 +1960,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
         set.WeeklyTechnologies.Sort((a, b) => string.Compare(a.TechnologyId, b.TechnologyId, StringComparison.Ordinal));
 
-        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+        if (!TryCommitResearchConfigChange(originalSet, set, out message))
             return false;
 
         message = $"Added weekly technology '{technologyId}' to branch '{branch}' in set '{set.SetId}'.";
@@ -1366,13 +2005,16 @@ public sealed class WeeklyModeSystem : EntitySystem
             return false;
         }
 
+        var recipeConfig = _store.LoadRecipesOrDefault(set.SetId);
+        var weeklyRecipeIds = recipeConfig.Recipes.Select(recipe => recipe.Id).ToHashSet(StringComparer.Ordinal);
         var recipes = new List<string>();
         foreach (var rawRecipe in recipeIds)
         {
             var recipeId = rawRecipe.Trim();
-            if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _))
+            if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _) &&
+                !weeklyRecipeIds.Contains(recipeId))
             {
-                message = $"Unknown lathe recipe prototype '{recipeId}'. No technology was changed.";
+                message = $"Unknown lathe or weekly recipe '{recipeId}'. No technology was changed.";
                 return false;
             }
 
@@ -1398,7 +2040,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         entry.RecipeIds = recipes;
         set.WeeklyTechnologies.Sort((a, b) => string.Compare(a.TechnologyId, b.TechnologyId, StringComparison.Ordinal));
 
-        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+        if (!TryCommitResearchConfigChange(originalSet, set, out message))
             return false;
 
         message = $"Updated weekly technology '{technologyId}' in set '{set.SetId}'.";
@@ -1425,7 +2067,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             string.Equals(entry.Branch, branch, StringComparison.Ordinal) &&
             string.Equals(entry.TechnologyId, technologyId, StringComparison.Ordinal));
 
-        if (removed > 0 && !TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+        if (removed > 0 && !TryCommitResearchConfigChange(originalSet, set, out message))
             return false;
 
         message = removed == 0
@@ -1474,7 +2116,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         var removed = set.WeeklyTechnologies.Count;
         set.WeeklyTechnologies.Clear();
 
-        if (!TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+        if (!TryCommitResearchConfigChange(originalSet, set, out message))
             return false;
 
         message = $"Cleared {removed} weekly technologies from set '{set.SetId}'.";
@@ -1506,7 +2148,7 @@ public sealed class WeeklyModeSystem : EntitySystem
 
         var removed = set.WeeklyTechnologies.RemoveAll(entry => string.Equals(entry.Branch, branch, StringComparison.Ordinal));
 
-        if (removed > 0 && !TryCommitConfigChange(originalSet, set, WeeklyLiveConfigChange.Research, out message))
+        if (removed > 0 && !TryCommitResearchConfigChange(originalSet, set, out message))
             return false;
 
         message = $"Cleared {removed} weekly technologies from branch '{branch}' in set '{set.SetId}'.";
@@ -1518,7 +2160,7 @@ public sealed class WeeklyModeSystem : EntitySystem
         if (!_store.TryLoadSet(setId, out var set))
             return $"Weekly set '{setId}' was not found.";
 
-        var errors = ValidateWeeklyTechnologies(set).ToList();
+        var errors = ValidateWeeklyTechnologies(set, _store.LoadRecipesOrDefault(set.SetId)).ToList();
         return errors.Count == 0
             ? $"Weekly research tree for '{set.SetId}' is valid."
             : $"Weekly research tree for '{set.SetId}' is invalid:\n- {string.Join("\n- ", errors)}";
@@ -1753,6 +2395,386 @@ public sealed class WeeklyModeSystem : EntitySystem
             : $"Weekly cargo catalog for '{set.SetId}' is invalid:\n- {string.Join("\n- ", errors)}";
     }
 
+    public bool TryAddRecipe(
+        string setId,
+        string recipeId,
+        string resultPrototype,
+        int resultAmount,
+        double productionTimeSeconds,
+        string latheTargets,
+        IReadOnlyList<string> materialSpecs,
+        out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var originalRecipes = CloneRecipes(recipes);
+
+        recipeId = recipeId.Trim();
+        if (recipes.Recipes.Any(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal)))
+        {
+            message = $"Weekly recipe '{recipeId}' already exists in set '{set.SetId}'.";
+            return false;
+        }
+
+        if (!TryBuildWeeklyRecipeDefinition(recipeId, resultPrototype, resultAmount, productionTimeSeconds, latheTargets, materialSpecs, out var recipe, out message))
+            return false;
+
+        recipes.Recipes.Add(recipe);
+        SortRecipes(recipes);
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (!TryCommitRecipesChange(set, originalRecipes, recipes, WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Added weekly recipe '{recipe.Id}' to set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryUpdateRecipe(string setId, string recipeId, string field, IReadOnlyList<string> args, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var originalRecipes = CloneRecipes(recipes);
+        var recipe = recipes.Recipes.FirstOrDefault(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal));
+        if (recipe == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no recipe '{recipeId}'.";
+            return false;
+        }
+
+        if (IsWeeklyRecipeInUse(recipe.Id))
+        {
+            message = $"Weekly recipe '{recipe.Id}' is currently queued or producing. Update refused to preserve material refunds and output consistency.";
+            return false;
+        }
+
+        switch (field.Trim().ToLowerInvariant())
+        {
+            case "result":
+                if (args.Count != 2 ||
+                    !int.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount))
+                {
+                    message = "Usage: wm.recipe.update <setId> <recipeId> result <resultPrototype> <amount>";
+                    return false;
+                }
+
+                recipe.ResultPrototype = args[0].Trim();
+                recipe.ResultAmount = amount;
+                break;
+            case "time":
+                if (args.Count != 1 ||
+                    !double.TryParse(args[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds))
+                {
+                    message = "Usage: wm.recipe.update <setId> <recipeId> time <seconds>";
+                    return false;
+                }
+
+                recipe.ProductionTimeSeconds = seconds;
+                break;
+            case "targets":
+                if (args.Count != 1 || !TryNormalizeLatheTargets(args[0], out var targets, out message))
+                    return false;
+
+                recipe.LatheTargets = targets;
+                break;
+            case "materials":
+                if (args.Count < 1 || !TryParseRecipeMaterials(args, out var materials, out message))
+                    return false;
+
+                recipe.Materials = materials;
+                break;
+            default:
+                message = "Recipe update field must be one of: result, time, targets, materials.";
+                return false;
+        }
+
+        SortRecipes(recipes);
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (!TryCommitRecipesChange(set, originalRecipes, recipes, WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Updated weekly recipe '{recipe.Id}' in set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryRemoveRecipe(string setId, string recipeId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var originalRecipes = CloneRecipes(recipes);
+        var recipe = recipes.Recipes.FirstOrDefault(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal));
+        if (recipe == null)
+        {
+            message = $"Weekly set '{set.SetId}' had no recipe '{recipeId}'.";
+            return false;
+        }
+
+        if (IsWeeklyRecipeInUse(recipe.Id))
+        {
+            message = $"Weekly recipe '{recipe.Id}' is currently queued or producing. Remove refused.";
+            return false;
+        }
+
+        var linkedTechnologies = set.WeeklyTechnologies
+            .Where(technology => technology.RecipeIds.Contains(recipe.Id, StringComparer.Ordinal))
+            .Select(technology => technology.TechnologyId)
+            .ToList();
+        if (linkedTechnologies.Count > 0)
+        {
+            message = $"Weekly recipe '{recipe.Id}' is linked to technologies and was not removed. Unlink it first: {FormatList(linkedTechnologies)}.";
+            return false;
+        }
+
+        recipes.Recipes.Remove(recipe);
+        SortRecipes(recipes);
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (!TryCommitRecipesChange(set, originalRecipes, recipes, WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Removed weekly recipe '{recipeId}' from set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryClearRecipes(string setId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var inUse = recipes.Recipes
+            .Where(recipe => IsWeeklyRecipeInUse(recipe.Id))
+            .Select(recipe => recipe.Id)
+            .ToList();
+        if (inUse.Count > 0)
+        {
+            message = $"Refusing to clear weekly recipes currently queued or producing: {FormatList(inUse)}.";
+            return false;
+        }
+
+        var originalRecipes = CloneRecipes(recipes);
+        var removed = recipes.Recipes.Count;
+        var linkedRecipes = recipes.Recipes
+            .Where(recipe => set.WeeklyTechnologies.Any(technology => technology.RecipeIds.Contains(recipe.Id, StringComparer.Ordinal)))
+            .Select(recipe => recipe.Id)
+            .ToList();
+        if (linkedRecipes.Count > 0)
+        {
+            message = $"Refusing to clear weekly recipes still linked to technologies: {FormatList(linkedRecipes)}.";
+            return false;
+        }
+
+        recipes.Recipes.Clear();
+
+        if (!TryCommitRecipesChange(set, originalRecipes, recipes, WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Cleared {removed} weekly recipes from set '{set.SetId}'.";
+        return true;
+    }
+
+    public bool TryAddRecipeTarget(string setId, string recipeId, string target, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var originalRecipes = CloneRecipes(recipes);
+        var recipe = recipes.Recipes.FirstOrDefault(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal));
+        if (recipe == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no recipe '{recipeId}'.";
+            return false;
+        }
+
+        if (IsWeeklyRecipeInUse(recipe.Id))
+        {
+            message = $"Weekly recipe '{recipe.Id}' is currently queued or producing. Target update refused.";
+            return false;
+        }
+
+        if (!TryNormalizeLatheTarget(target, out var normalizedTarget, out message))
+            return false;
+
+        if (!recipe.LatheTargets.Contains(normalizedTarget, StringComparer.Ordinal))
+            recipe.LatheTargets.Add(normalizedTarget);
+        recipe.LatheTargets.Sort(StringComparer.Ordinal);
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (!TryCommitRecipesChange(set, originalRecipes, recipes, WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Added target '{normalizedTarget}' to weekly recipe '{recipe.Id}'.";
+        return true;
+    }
+
+    public bool TryRemoveRecipeTarget(string setId, string recipeId, string target, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var originalRecipes = CloneRecipes(recipes);
+        var recipe = recipes.Recipes.FirstOrDefault(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal));
+        if (recipe == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no recipe '{recipeId}'.";
+            return false;
+        }
+
+        if (IsWeeklyRecipeInUse(recipe.Id))
+        {
+            message = $"Weekly recipe '{recipe.Id}' is currently queued or producing. Target update refused.";
+            return false;
+        }
+
+        if (!TryNormalizeLatheTarget(target, out var normalizedTarget, out message))
+            return false;
+
+        recipe.LatheTargets.RemoveAll(existing => string.Equals(existing, normalizedTarget, StringComparison.Ordinal));
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (!TryCommitRecipesChange(set, originalRecipes, recipes, WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Removed target '{normalizedTarget}' from weekly recipe '{recipe.Id}'.";
+        return true;
+    }
+
+    public bool TryLinkRecipe(string setId, string recipeId, string technologyId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        var technology = set.WeeklyTechnologies.FirstOrDefault(entry => string.Equals(entry.TechnologyId, technologyId, StringComparison.Ordinal));
+        if (technology == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no technology '{technologyId}'.";
+            return false;
+        }
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        if (!recipes.Recipes.Any(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal)))
+        {
+            message = $"Weekly set '{set.SetId}' has no recipe '{recipeId}'.";
+            return false;
+        }
+
+        if (technology.RecipeIds.Contains(recipeId, StringComparer.Ordinal))
+        {
+            message = $"Weekly recipe '{recipeId}' is already linked to technology '{technologyId}'.";
+            return false;
+        }
+
+        var originalSet = CloneSet(set);
+        var originalRecipes = CloneRecipes(recipes);
+        technology.RecipeIds.Add(recipeId);
+        technology.RecipeIds.Sort(StringComparer.Ordinal);
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (!TryCommitConfigAndRecipesChange(originalSet, set, originalRecipes, recipes, WeeklyLiveConfigChange.Research | WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = $"Linked weekly recipe '{recipeId}' to technology '{technologyId}'.";
+        return true;
+    }
+
+    public bool TryUnlinkRecipe(string setId, string recipeId, string technologyId, out string message)
+    {
+        if (!TryLoadConfigEditableSet(setId, out var set, out message))
+            return false;
+
+        if (IsWeeklyRecipeInUse(recipeId))
+        {
+            message = $"Weekly recipe '{recipeId}' is currently queued or producing. Unlink refused.";
+            return false;
+        }
+
+        var technology = set.WeeklyTechnologies.FirstOrDefault(entry => string.Equals(entry.TechnologyId, technologyId, StringComparison.Ordinal));
+        if (technology == null)
+        {
+            message = $"Weekly set '{set.SetId}' has no technology '{technologyId}'.";
+            return false;
+        }
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        var originalSet = CloneSet(set);
+        var originalRecipes = CloneRecipes(recipes);
+        var removed = technology.RecipeIds.RemoveAll(id => string.Equals(id, recipeId, StringComparison.Ordinal));
+        SyncRecipeTechnologyLinks(set, recipes);
+
+        if (removed > 0 && !TryCommitConfigAndRecipesChange(originalSet, set, originalRecipes, recipes, WeeklyLiveConfigChange.Research | WeeklyLiveConfigChange.Recipes, out message))
+            return false;
+
+        message = removed == 0
+            ? $"Weekly recipe '{recipeId}' was not linked to technology '{technologyId}'."
+            : $"Unlinked weekly recipe '{recipeId}' from technology '{technologyId}'.";
+        return true;
+    }
+
+    public string ListRecipes(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        SyncRecipeTechnologyLinks(set, recipes);
+        if (recipes.Recipes.Count == 0)
+            return $"Weekly set '{set.SetId}' has no campaign recipes.";
+
+        var lines = new List<string> { $"Weekly recipes for '{set.SetId}':" };
+        foreach (var recipe in recipes.Recipes.OrderBy(recipe => recipe.Id, StringComparer.Ordinal))
+        {
+            lines.Add($"- {recipe.Id}: result={recipe.ResultPrototype}x{recipe.ResultAmount} time={recipe.ProductionTimeSeconds.ToString(CultureInfo.InvariantCulture)}s targets=[{FormatList(recipe.LatheTargets)}] materials=[{FormatDictionary(recipe.Materials)}] technologies=[{FormatList(recipe.TechnologyIds)}]");
+        }
+
+        return string.Join('\n', lines);
+    }
+
+    public string ShowRecipe(string setId, string recipeId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        SyncRecipeTechnologyLinks(set, recipes);
+        var recipe = recipes.Recipes.FirstOrDefault(recipe => string.Equals(recipe.Id, recipeId, StringComparison.Ordinal));
+        if (recipe == null)
+            return $"Weekly set '{set.SetId}' has no recipe '{recipeId}'.";
+
+        return string.Join('\n', new[]
+        {
+            $"Weekly recipe '{recipe.Id}' in set '{set.SetId}':",
+            $"- resultPrototype: {recipe.ResultPrototype}",
+            $"- resultAmount: {recipe.ResultAmount}",
+            $"- productionTimeSeconds: {recipe.ProductionTimeSeconds.ToString(CultureInfo.InvariantCulture)}",
+            $"- latheTargets: {FormatList(recipe.LatheTargets)}",
+            $"- materials: {FormatDictionary(recipe.Materials)}",
+            $"- technologyIds: {FormatList(recipe.TechnologyIds)}",
+        });
+    }
+
+    public string ValidateRecipes(string setId)
+    {
+        if (!_store.TryLoadSet(setId, out var set))
+            return $"Weekly set '{setId}' was not found.";
+
+        var recipes = _store.LoadRecipesOrDefault(set.SetId);
+        SyncRecipeTechnologyLinks(set, recipes);
+        var errors = ValidateWeeklyRecipes(set, recipes).ToList();
+        errors.AddRange(ValidateWeeklyTechnologies(set, recipes));
+        return errors.Count == 0
+            ? $"Weekly recipes for '{set.SetId}' are valid."
+            : $"Weekly recipes for '{set.SetId}' are invalid:\n- {string.Join("\n- ", errors)}";
+    }
+
     public string ShowConfig(string setId)
     {
         if (!_store.TryLoadSet(setId, out var set))
@@ -1770,6 +2792,7 @@ public sealed class WeeklyModeSystem : EntitySystem
             $"- disabledRoles: {FormatList(set.DefaultDisabledJobs)}",
             $"- roleAliases: {FormatDictionary(set.DefaultRoleAliases)}",
             $"- roleLimits: {FormatDictionary(set.DefaultRoleLimits)}",
+            $"- forcedRoleAssignments: {set.ForcedRoleAssignments.Count} entries",
             $"- persistAutonomousMobs: {set.PersistAutonomousMobs}",
             $"- persistPlayerControlledBorgs: {set.PersistPlayerControlledBorgs}",
             $"- excludedMobPrototypes: {FormatList(set.ExcludedMobPrototypes)}",
@@ -1904,6 +2927,60 @@ public sealed class WeeklyModeSystem : EntitySystem
         return true;
     }
 
+    public List<WeeklyLatheRecipeData> GetAvailableWeeklyLatheRecipes(EntityUid latheUid, LatheComponent lathe, bool getUnavailable = false)
+    {
+        var recipes = new List<WeeklyLatheRecipeData>();
+        if (!TryGetActiveWeeklyRecipeDefinitions(out var definitions))
+            return recipes;
+
+        foreach (var definition in definitions)
+        {
+            if (!IsWeeklyRecipeTargetMatch(latheUid, lathe, definition))
+                continue;
+
+            if (!getUnavailable && !IsWeeklyRecipeUnlockedForLathe(latheUid, definition))
+                continue;
+
+            if (TryBuildWeeklyLatheRecipeData(definition, out var data))
+                recipes.Add(data);
+        }
+
+        recipes.Sort((a, b) => string.Compare(a.RecipeId, b.RecipeId, StringComparison.Ordinal));
+        return recipes;
+    }
+
+    public bool TryGetAvailableWeeklyLatheRecipe(EntityUid latheUid, LatheComponent lathe, string recipeId, out WeeklyLatheRecipeData recipe)
+    {
+        recipe = default;
+        foreach (var candidate in GetAvailableWeeklyLatheRecipes(latheUid, lathe))
+        {
+            if (!string.Equals(candidate.RecipeId, recipeId, StringComparison.Ordinal))
+                continue;
+
+            recipe = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    public bool TryGetActiveWeeklyLatheRecipe(string recipeId, out WeeklyLatheRecipeData recipe)
+    {
+        recipe = default;
+        if (!TryGetActiveWeeklyRecipeDefinitions(out var definitions))
+            return false;
+
+        foreach (var definition in definitions)
+        {
+            if (!string.Equals(definition.Id, recipeId, StringComparison.Ordinal))
+                continue;
+
+            return TryBuildWeeklyLatheRecipeData(definition, out recipe);
+        }
+
+        return false;
+    }
+
     private bool TryBuildWeeklyCargoProductData(WeeklyCargoProductEntry entry, out WeeklyCargoProductData product)
     {
         product = default;
@@ -1921,6 +2998,118 @@ public sealed class WeeklyModeSystem : EntitySystem
             Amount = entry.Amount,
             ItemPrototype = entry.ItemPrototype,
             Icon = new SpriteSpecifier.EntityPrototype(entry.ItemPrototype),
+        };
+
+        return true;
+    }
+
+    private bool TryGetActiveWeeklyRecipeDefinitions(out List<WeeklyRecipeDefinition> recipes)
+    {
+        recipes = new List<WeeklyRecipeDefinition>();
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return false;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
+            return false;
+
+        var config = _store.LoadRecipesOrDefault(set.SetId);
+        SyncRecipeTechnologyLinks(set, config);
+        recipes = config.Recipes;
+        return true;
+    }
+
+    private bool IsWeeklyRecipeUnlockedForLathe(EntityUid latheUid, WeeklyRecipeDefinition recipe)
+    {
+        if (!TryComp<TechnologyDatabaseComponent>(latheUid, out var database) || !database.WeeklyModeOnly)
+            return false;
+
+        foreach (var technologyId in recipe.TechnologyIds)
+        {
+            foreach (var unlockedTechnologyId in database.WeeklyUnlockedTechnologies)
+            {
+                if (string.Equals(unlockedTechnologyId, technologyId, StringComparison.Ordinal))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsWeeklyRecipeTargetMatch(EntityUid latheUid, LatheComponent lathe, WeeklyRecipeDefinition recipe)
+    {
+        if (recipe.LatheTargets.Count == 0)
+            return false;
+
+        var prototypeId = MetaData(latheUid).EntityPrototype?.ID;
+        foreach (var target in recipe.LatheTargets)
+        {
+            if (IsWeeklyRecipeTargetMatch(target, prototypeId, lathe))
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool IsWeeklyRecipeTargetMatch(string target, string? entityPrototypeId, LatheComponent lathe)
+    {
+        if (WeeklyRecipeTargetAliases.TryGetValue(target, out var alias))
+        {
+            if (alias.All)
+                return true;
+
+            if (entityPrototypeId != null &&
+                alias.Entities.Any(entity => string.Equals(entity, entityPrototypeId, StringComparison.Ordinal)))
+            {
+                return true;
+            }
+
+            return alias.Packs.Any(pack => LatheHasPack(lathe, pack));
+        }
+
+        if (target.StartsWith("entity:", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = target["entity:".Length..];
+            return entityPrototypeId != null && string.Equals(id, entityPrototypeId, StringComparison.Ordinal);
+        }
+
+        if (target.StartsWith("pack:", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = target["pack:".Length..];
+            return LatheHasPack(lathe, id);
+        }
+
+        return false;
+    }
+
+    private static bool LatheHasPack(LatheComponent lathe, string packId)
+    {
+        return lathe.StaticPacks.Any(pack => string.Equals(pack.Id, packId, StringComparison.Ordinal)) ||
+               lathe.DynamicPacks.Any(pack => string.Equals(pack.Id, packId, StringComparison.Ordinal));
+    }
+
+    private bool TryBuildWeeklyLatheRecipeData(WeeklyRecipeDefinition definition, out WeeklyLatheRecipeData recipe)
+    {
+        recipe = default;
+        if (!_prototype.TryIndex<EntityPrototype>(definition.ResultPrototype, out var resultPrototype))
+            return false;
+
+        recipe = new WeeklyLatheRecipeData
+        {
+            RecipeId = definition.Id,
+            Name = resultPrototype.Name,
+            Description = resultPrototype.Description,
+            ResultPrototype = definition.ResultPrototype,
+            ResultAmount = definition.ResultAmount,
+            ProductionTimeSeconds = definition.ProductionTimeSeconds,
+            Materials = definition.Materials
+                .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => new WeeklyLatheRecipeMaterialData
+                {
+                    MaterialId = pair.Key,
+                    Amount = pair.Value,
+                })
+                .ToList(),
+            Icon = new SpriteSpecifier.EntityPrototype(definition.ResultPrototype),
         };
 
         return true;
@@ -1966,10 +3155,13 @@ public sealed class WeeklyModeSystem : EntitySystem
         if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
             return;
 
-        if (!_store.TryLoadSet(_state.ActiveSetId, out var set) || set.MinPlaytimeHours <= 0)
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
             return;
 
-        if (IsWeeklyAccessAllowed(ev.PlayerSession, set, false))
+        if (TryGetForcedAssignment(set, ev.PlayerSession.UserId, out var forcedAssignment))
+            NotifyForcedRole(ev.PlayerSession, set, forcedAssignment, false);
+
+        if (set.MinPlaytimeHours <= 0 || IsWeeklyAccessAllowed(ev.PlayerSession, set, false))
             return;
 
         if (_accessLobbyNoticeSent.Add(ev.PlayerSession.UserId))
@@ -1981,12 +3173,41 @@ public sealed class WeeklyModeSystem : EntitySystem
         if (!_playerManager.TryGetSessionById(ev.Player, out var session))
             return;
 
+        if (IsWeeklyAccessAllowed(session, false))
+            return;
+
+        if (TryGetActiveForcedAssignment(ev.Player, out _, out var assignment) &&
+            assignment.BypassPlaytime)
+        {
+            ev.Jobs.Clear();
+            ev.Jobs.Add(new ProtoId<JobPrototype>(assignment.JobId));
+            return;
+        }
+
         if (!IsWeeklyAccessAllowed(session, true))
             ev.Jobs.Clear();
     }
 
     private void OnIsRoleAllowed(ref IsRoleAllowedEvent ev)
     {
+        if (ev.Jobs is { Count: > 0 })
+        {
+            foreach (var job in ev.Jobs)
+            {
+                if (!CanLateJoinJob(ev.Player, EntityUid.Invalid, job, out _))
+                {
+                    ev.Cancelled = true;
+                    return;
+                }
+            }
+        }
+
+        if (ev.Jobs is { Count: 1 } &&
+            IsWeeklyAccessAllowedForJob(ev.Player, ev.Jobs[0].Id, true))
+        {
+            return;
+        }
+
         if (IsWeeklyAccessAllowed(ev.Player, true))
             return;
 
@@ -1996,7 +3217,32 @@ public sealed class WeeklyModeSystem : EntitySystem
     private void OnGetDisallowedJobs(ref GetDisallowedJobsEvent ev)
     {
         if (IsWeeklyAccessAllowed(ev.Player, false))
+        {
+            foreach (var job in _prototype.EnumeratePrototypes<JobPrototype>())
+            {
+                var jobId = new ProtoId<JobPrototype>(job.ID);
+                if (IsJobFullyReservedForOthers(jobId) &&
+                    (!TryGetActiveForcedAssignment(ev.Player.UserId, out _, out var assignment) ||
+                     !string.Equals(assignment.JobId, job.ID, StringComparison.Ordinal)))
+                {
+                    ev.Jobs.Add(jobId);
+                }
+            }
+
             return;
+        }
+
+        if (TryGetActiveForcedAssignment(ev.Player.UserId, out _, out var forcedAssignment) &&
+            forcedAssignment.BypassPlaytime)
+        {
+            foreach (var job in _prototype.EnumeratePrototypes<JobPrototype>())
+            {
+                if (!string.Equals(job.ID, forcedAssignment.JobId, StringComparison.Ordinal))
+                    ev.Jobs.Add(job.ID);
+            }
+
+            return;
+        }
 
         foreach (var job in _prototype.EnumeratePrototypes<JobPrototype>())
             ev.Jobs.Add(job.ID);
@@ -2127,6 +3373,18 @@ public sealed class WeeklyModeSystem : EntitySystem
 
         ApplyRoleOverridesToStation(ev.Station, set);
         ApplyWeeklyResearchOverlay(set);
+    }
+
+    private void OnTechnologyDatabaseStartup(EntityUid uid, TechnologyDatabaseComponent component, ComponentStartup args)
+    {
+        if (!_enabled || !_state.IsActive || _state.ActiveSetId == null)
+            return;
+
+        if (!_store.TryLoadSet(_state.ActiveSetId, out var set))
+            return;
+
+        _research.SetWeeklyModeOverlay(uid, true, BuildWeeklyResearchData(set), true, component);
+        RaiseLocalEvent(new WeeklyRecipesChangedEvent());
     }
 
     private void OnRoundStarted(RoundStartedEvent ev)
@@ -2908,6 +4166,8 @@ public sealed class WeeklyModeSystem : EntitySystem
         var query = EntityQueryEnumerator<TechnologyDatabaseComponent>();
         while (query.MoveNext(out var uid, out var database))
             _research.SetWeeklyModeOverlay(uid, true, technologies, true, database);
+
+        RaiseLocalEvent(new WeeklyRecipesChangedEvent());
     }
 
     private void RestoreWeeklyResearchOverlay()
@@ -3681,6 +4941,266 @@ public sealed class WeeklyModeSystem : EntitySystem
         return false;
     }
 
+    private bool TryBuildWeeklyRecipeDefinition(
+        string recipeId,
+        string resultPrototype,
+        int resultAmount,
+        double productionTimeSeconds,
+        string latheTargets,
+        IReadOnlyList<string> materialSpecs,
+        out WeeklyRecipeDefinition recipe,
+        out string message)
+    {
+        recipe = new WeeklyRecipeDefinition();
+
+        if (!WeeklyModeStore.IsSafeId(recipeId))
+        {
+            message = "recipeId must contain only ASCII letters, digits, '-', '_' or '.'.";
+            return false;
+        }
+
+        if (_prototype.HasIndex<LatheRecipePrototype>(recipeId))
+        {
+            message = $"Weekly recipeId '{recipeId}' conflicts with an existing global lathe recipe prototype.";
+            return false;
+        }
+
+        resultPrototype = resultPrototype.Trim();
+        if (!_prototype.TryIndex<EntityPrototype>(resultPrototype, out var entityPrototype))
+        {
+            message = $"Unknown result entity prototype: {resultPrototype}";
+            return false;
+        }
+
+        if (entityPrototype.Abstract)
+        {
+            message = $"Result entity prototype is abstract and cannot be produced: {resultPrototype}";
+            return false;
+        }
+
+        if (resultAmount < 1)
+        {
+            message = "resultAmount must be at least 1.";
+            return false;
+        }
+
+        if (!double.IsFinite(productionTimeSeconds) || productionTimeSeconds <= 0)
+        {
+            message = "productionTimeSeconds must be greater than zero.";
+            return false;
+        }
+
+        if (!TryNormalizeLatheTargets(latheTargets, out var targets, out message))
+            return false;
+
+        if (!TryParseRecipeMaterials(materialSpecs, out var materials, out message))
+            return false;
+
+        recipe = new WeeklyRecipeDefinition
+        {
+            Id = recipeId,
+            ResultPrototype = resultPrototype,
+            ResultAmount = resultAmount,
+            ProductionTimeSeconds = productionTimeSeconds,
+            LatheTargets = targets,
+            Materials = materials,
+        };
+        message = string.Empty;
+        return true;
+    }
+
+    private bool TryNormalizeLatheTargets(string rawTargets, out List<string> targets, out string message)
+    {
+        targets = new List<string>();
+        foreach (var rawTarget in rawTargets.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!TryNormalizeLatheTarget(rawTarget, out var target, out message))
+                return false;
+
+            if (!targets.Contains(target, StringComparer.Ordinal))
+                targets.Add(target);
+        }
+
+        targets.Sort(StringComparer.Ordinal);
+        if (targets.Count == 0)
+        {
+            message = "At least one lathe target must be specified.";
+            return false;
+        }
+
+        message = string.Empty;
+        return true;
+    }
+
+    private bool TryNormalizeLatheTarget(string rawTarget, out string target, out string message)
+    {
+        target = rawTarget.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            message = "Lathe target may not be empty.";
+            return false;
+        }
+
+        if (WeeklyRecipeTargetAliases.TryGetValue(target, out var alias))
+        {
+            foreach (var entityId in alias.Entities)
+            {
+                if (!IsValidLatheEntityPrototype(entityId))
+                {
+                    message = $"Weekly recipe target alias '{target}' references missing lathe entity prototype '{entityId}'.";
+                    return false;
+                }
+            }
+
+            foreach (var packId in alias.Packs)
+            {
+                if (!_prototype.HasIndex<LatheRecipePackPrototype>(packId))
+                {
+                    message = $"Weekly recipe target alias '{target}' references missing lathe recipe pack '{packId}'.";
+                    return false;
+                }
+            }
+
+            target = target.ToLowerInvariant();
+            message = string.Empty;
+            return true;
+        }
+
+        if (target.StartsWith("entity:", StringComparison.OrdinalIgnoreCase))
+        {
+            var entityId = target["entity:".Length..].Trim();
+            if (!IsValidLatheEntityPrototype(entityId))
+            {
+                message = $"Unknown lathe entity target: entity:{entityId}";
+                return false;
+            }
+
+            target = $"entity:{entityId}";
+            message = string.Empty;
+            return true;
+        }
+
+        if (target.StartsWith("pack:", StringComparison.OrdinalIgnoreCase))
+        {
+            var packId = target["pack:".Length..].Trim();
+            if (!_prototype.HasIndex<LatheRecipePackPrototype>(packId))
+            {
+                message = $"Unknown lathe recipe pack target: pack:{packId}";
+                return false;
+            }
+
+            target = $"pack:{packId}";
+            message = string.Empty;
+            return true;
+        }
+
+        message = $"Unknown lathe target '{target}'. Use an alias ({FormatList(WeeklyRecipeTargetAliases.Keys)}), entity:<LatheEntityPrototypeId>, or pack:<LatheRecipePackPrototypeId>.";
+        return false;
+    }
+
+    private bool IsValidLatheEntityPrototype(string entityId)
+    {
+        return _prototype.TryIndex<EntityPrototype>(entityId, out var entityPrototype) &&
+               !entityPrototype.Abstract &&
+               entityPrototype.Components.ContainsKey("Lathe");
+    }
+
+    private bool TryParseRecipeMaterials(IReadOnlyList<string> materialSpecs, out Dictionary<string, int> materials, out string message)
+    {
+        materials = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var spec in materialSpecs)
+        {
+            var parts = spec.Split(':', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length != 2)
+            {
+                message = $"Material '{spec}' must use MaterialPrototypeId:Amount.";
+                return false;
+            }
+
+            var materialId = parts[0];
+            if (!_prototype.HasIndex<MaterialPrototype>(materialId))
+            {
+                message = $"Unknown material prototype: {materialId}";
+                return false;
+            }
+
+            if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var amount) || amount <= 0)
+            {
+                message = $"Material amount for '{materialId}' must be greater than zero.";
+                return false;
+            }
+
+            materials[materialId] = materials.TryGetValue(materialId, out var existing)
+                ? existing + amount
+                : amount;
+        }
+
+        if (materials.Count == 0)
+        {
+            message = "At least one material must be specified.";
+            return false;
+        }
+
+        message = string.Empty;
+        return true;
+    }
+
+    private static void SortRecipes(WeeklyRecipesConfig recipes)
+    {
+        recipes.Recipes.Sort((a, b) => string.Compare(a.Id, b.Id, StringComparison.Ordinal));
+        foreach (var recipe in recipes.Recipes)
+        {
+            recipe.LatheTargets = recipe.LatheTargets.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+            recipe.Materials = recipe.Materials.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            recipe.TechnologyIds = recipe.TechnologyIds.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        }
+    }
+
+    private static void SyncRecipeTechnologyLinks(WeeklyModeSet set, WeeklyRecipesConfig recipes)
+    {
+        foreach (var recipe in recipes.Recipes)
+        {
+            recipe.TechnologyIds = set.WeeklyTechnologies
+                .Where(technology => technology.RecipeIds.Contains(recipe.Id, StringComparer.Ordinal))
+                .Select(technology => technology.TechnologyId)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(id => id, StringComparer.Ordinal)
+                .ToList();
+        }
+
+        SortRecipes(recipes);
+    }
+
+    private bool IsWeeklyRecipeInUse(string recipeId)
+    {
+        if (!_state.IsActive)
+            return false;
+
+        var query = EntityQueryEnumerator<LatheComponent>();
+        while (query.MoveNext(out _, out var lathe))
+        {
+            if (lathe.CurrentRecipeIsWeekly &&
+                string.Equals(lathe.CurrentRecipe, recipeId, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            foreach (var batch in lathe.Queue)
+            {
+                if (batch.IsWeekly && string.Equals(batch.Recipe, recipeId, StringComparison.Ordinal))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private WeeklyRecipesConfig CloneRecipes(WeeklyRecipesConfig recipes)
+    {
+        return JsonSerializer.Deserialize<WeeklyRecipesConfig>(_store.ExportRecipesJson(recipes))
+               ?? throw new InvalidOperationException("Failed to clone weekly recipe config.");
+    }
+
     private bool TryLoadMutableSet(string setId, [NotNullWhen(true)] out WeeklyModeSet? set, out string message)
     {
         set = null;
@@ -3747,6 +5267,115 @@ public sealed class WeeklyModeSystem : EntitySystem
         }
     }
 
+    private bool TryCommitRecipesChange(WeeklyModeSet set, WeeklyRecipesConfig originalRecipes, WeeklyRecipesConfig changedRecipes, WeeklyLiveConfigChange liveChange, out string message)
+    {
+        var errors = ValidateWeeklyRecipes(set, changedRecipes).ToList();
+        if (errors.Count > 0)
+        {
+            message = $"Weekly recipes for '{set.SetId}' are invalid:\n- {string.Join("\n- ", errors)}";
+            return false;
+        }
+
+        var active = IsActiveSet(set.SetId);
+        var saved = false;
+        try
+        {
+            _store.SaveRecipes(set.SetId, changedRecipes);
+            saved = true;
+
+            if (active)
+                ApplyLiveConfigChange(set, liveChange);
+
+            message = string.Empty;
+            return true;
+        }
+        catch (Exception e)
+        {
+            if (active && saved)
+            {
+                try
+                {
+                    _store.SaveRecipes(set.SetId, originalRecipes);
+                    ApplyLiveConfigChange(set, liveChange);
+                }
+                catch (Exception rollbackException)
+                {
+                    _sawmill.Error($"Failed to roll back live weekly recipe change for set '{set.SetId}': {rollbackException}");
+                }
+            }
+
+            message = $"Failed to apply weekly recipe change for set '{set.SetId}': {e.Message}";
+            return false;
+        }
+    }
+
+    private bool TryCommitResearchConfigChange(WeeklyModeSet originalSet, WeeklyModeSet changedSet, out string message)
+    {
+        var originalRecipes = _store.LoadRecipesOrDefault(changedSet.SetId);
+        var changedRecipes = CloneRecipes(originalRecipes);
+        SyncRecipeTechnologyLinks(changedSet, changedRecipes);
+        return TryCommitConfigAndRecipesChange(originalSet, changedSet, originalRecipes, changedRecipes, WeeklyLiveConfigChange.Research | WeeklyLiveConfigChange.Recipes, out message);
+    }
+
+    private bool TryCommitConfigAndRecipesChange(
+        WeeklyModeSet originalSet,
+        WeeklyModeSet changedSet,
+        WeeklyRecipesConfig originalRecipes,
+        WeeklyRecipesConfig changedRecipes,
+        WeeklyLiveConfigChange liveChange,
+        out string message)
+    {
+        if (!TryValidateSetConfig(changedSet, out var setErrors))
+        {
+            message = $"Weekly set '{changedSet.SetId}' config is invalid:\n- {string.Join("\n- ", setErrors)}";
+            return false;
+        }
+
+        var recipeErrors = ValidateWeeklyRecipes(changedSet, changedRecipes).ToList();
+        if (recipeErrors.Count > 0)
+        {
+            message = $"Weekly recipes for '{changedSet.SetId}' are invalid:\n- {string.Join("\n- ", recipeErrors)}";
+            return false;
+        }
+
+        var active = IsActiveSet(changedSet.SetId);
+        var savedSet = false;
+        var savedRecipes = false;
+        try
+        {
+            _store.SaveSet(changedSet);
+            savedSet = true;
+            _store.SaveRecipes(changedSet.SetId, changedRecipes);
+            savedRecipes = true;
+
+            if (active)
+                ApplyLiveConfigChange(changedSet, liveChange);
+
+            message = string.Empty;
+            return true;
+        }
+        catch (Exception e)
+        {
+            if (savedSet || savedRecipes)
+            {
+                try
+                {
+                    _store.SaveSet(originalSet);
+                    _store.SaveRecipes(originalSet.SetId, originalRecipes);
+                    if (active)
+                        ApplyLiveConfigChange(originalSet, liveChange);
+                }
+                catch (Exception rollbackException)
+                {
+                    _sawmill.Error($"Failed to roll back weekly config and recipe change for set '{changedSet.SetId}': {rollbackException}");
+                }
+            }
+
+            message = $"Failed to apply weekly config change for set '{changedSet.SetId}': {e.Message}";
+            return false;
+        }
+    }
+
     private void ApplyLiveConfigChange(WeeklyModeSet set, WeeklyLiveConfigChange liveChange)
     {
         if ((liveChange & WeeklyLiveConfigChange.Research) != 0)
@@ -3758,6 +5387,16 @@ public sealed class WeeklyModeSystem : EntitySystem
         if ((liveChange & WeeklyLiveConfigChange.Cargo) != 0)
         {
             RaiseLocalEvent(new WeeklyCargoCatalogChangedEvent());
+        }
+
+        if ((liveChange & WeeklyLiveConfigChange.Roles) != 0)
+        {
+            ApplyRoleOverridesToStations(set);
+        }
+
+        if ((liveChange & (WeeklyLiveConfigChange.Research | WeeklyLiveConfigChange.Recipes)) != 0)
+        {
+            RaiseLocalEvent(new WeeklyRecipesChangedEvent());
         }
     }
 
@@ -3789,6 +5428,52 @@ public sealed class WeeklyModeSystem : EntitySystem
         }
 
         return purchased;
+    }
+
+    private IEnumerable<string> ValidateForcedRoleAssignments(WeeklyModeSet set)
+    {
+        var errors = new List<string>();
+        var seenPlayers = new HashSet<Guid>();
+        var seenRecords = new HashSet<string>(StringComparer.Ordinal);
+        var countsByJob = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var assignment in set.ForcedRoleAssignments)
+        {
+            if (!Guid.TryParse(assignment.PlayerNetUserId, out var userId))
+            {
+                errors.Add($"forced role assignment has invalid playerNetUserId '{assignment.PlayerNetUserId}'");
+                continue;
+            }
+
+            if (!seenPlayers.Add(userId))
+                errors.Add($"player '{assignment.PlayerNetUserId}' has more than one forced role assignment");
+
+            var recordKey = $"{assignment.PlayerNetUserId}:{assignment.JobId}";
+            if (!seenRecords.Add(recordKey))
+                errors.Add($"duplicate forced role assignment '{recordKey}'");
+
+            if (string.IsNullOrWhiteSpace(assignment.LastKnownCKey))
+                errors.Add($"forced role assignment '{assignment.PlayerNetUserId}' has empty lastKnownCKey");
+
+            if (!_prototype.TryIndex<JobPrototype>(assignment.JobId, out _))
+                errors.Add($"forced role assignment for '{assignment.PlayerNetUserId}' has unknown job prototype '{assignment.JobId}'");
+
+            if (set.DefaultDisabledJobs.Contains(assignment.JobId))
+                errors.Add($"forced role assignment for '{assignment.PlayerNetUserId}' uses disabled job '{assignment.JobId}'");
+
+            if (set.DefaultRoleLimits.TryGetValue(assignment.JobId, out var limit) && limit == 0)
+                errors.Add($"forced role assignment for '{assignment.PlayerNetUserId}' uses job '{assignment.JobId}' with campaign role limit 0");
+
+            countsByJob[assignment.JobId] = countsByJob.GetValueOrDefault(assignment.JobId) + 1;
+        }
+
+        foreach (var (jobId, count) in countsByJob)
+        {
+            if (set.DefaultRoleLimits.TryGetValue(jobId, out var limit) && limit >= 0 && count > limit)
+                errors.Add($"forced role assignments for '{jobId}' exceed campaign role limit {limit}: {count}");
+        }
+
+        return errors;
     }
 
     private bool TryValidateSetConfig(WeeklyModeSet set, out List<string> errors)
@@ -3866,8 +5551,11 @@ public sealed class WeeklyModeSystem : EntitySystem
         if (set.DiscordChannel.Any(char.IsControl))
             errors.Add("discord channel/link may not contain control characters");
 
-        errors.AddRange(ValidateWeeklyTechnologies(set));
+        var weeklyRecipes = _store.LoadRecipesOrDefault(set.SetId);
+        errors.AddRange(ValidateWeeklyRecipes(set, weeklyRecipes));
+        errors.AddRange(ValidateWeeklyTechnologies(set, weeklyRecipes));
         errors.AddRange(ValidateWeeklyCargoProducts(set));
+        errors.AddRange(ValidateForcedRoleAssignments(set));
 
         return errors.Count == 0;
     }
@@ -3886,7 +5574,9 @@ public sealed class WeeklyModeSystem : EntitySystem
         _autosaveWarningIssued = false;
         _accessLobbyNoticeSent.Clear();
         _accessNoticeCooldowns.Clear();
+        _forcedRoleNoticeCooldowns.Clear();
         RestoreWeeklyResearchOverlay();
+        RaiseLocalEvent(new WeeklyRecipesChangedEvent());
         _gameMapManager.ClearSelectedMap();
         _store.SaveState(_state);
     }
@@ -3995,6 +5685,12 @@ public sealed class WeeklyModeSystem : EntitySystem
 
     private IEnumerable<string> ValidateWeeklyTechnologies(WeeklyModeSet set)
     {
+        return ValidateWeeklyTechnologies(set, _store.LoadRecipesOrDefault(set.SetId));
+    }
+
+    private IEnumerable<string> ValidateWeeklyTechnologies(WeeklyModeSet set, WeeklyRecipesConfig recipes)
+    {
+        var weeklyRecipeIds = recipes.Recipes.Select(recipe => recipe.Id).ToHashSet(StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in set.WeeklyTechnologies)
         {
@@ -4022,8 +5718,75 @@ public sealed class WeeklyModeSystem : EntitySystem
 
             foreach (var recipeId in entry.RecipeIds.Distinct(StringComparer.Ordinal))
             {
-                if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _))
+                if (!_prototype.TryIndex<LatheRecipePrototype>(recipeId, out _) &&
+                    !weeklyRecipeIds.Contains(recipeId))
+                {
                     yield return $"technology '{entry.TechnologyId}' references unknown recipe '{recipeId}'";
+                }
+            }
+        }
+    }
+
+    private IEnumerable<string> ValidateWeeklyRecipes(WeeklyModeSet set, WeeklyRecipesConfig recipes)
+    {
+        if (recipes.SchemaVersion != WeeklyRecipesConfig.CurrentSchemaVersion)
+            yield return $"recipes schemaVersion {recipes.SchemaVersion} is not compatible with {WeeklyRecipesConfig.CurrentSchemaVersion}";
+
+        var technologyIds = set.WeeklyTechnologies
+            .Select(technology => technology.TechnologyId)
+            .ToHashSet(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var recipe in recipes.Recipes)
+        {
+            if (!WeeklyModeStore.IsSafeId(recipe.Id))
+                yield return $"recipeId '{recipe.Id}' is not a safe id";
+
+            if (!seen.Add(recipe.Id))
+                yield return $"duplicate weekly recipe '{recipe.Id}'";
+
+            if (_prototype.HasIndex<LatheRecipePrototype>(recipe.Id))
+                yield return $"recipe '{recipe.Id}' conflicts with a global lathe recipe prototype";
+
+            if (!_prototype.TryIndex<EntityPrototype>(recipe.ResultPrototype, out var resultPrototype))
+            {
+                yield return $"recipe '{recipe.Id}' references unknown result entity prototype '{recipe.ResultPrototype}'";
+            }
+            else if (resultPrototype.Abstract)
+            {
+                yield return $"recipe '{recipe.Id}' result entity prototype '{recipe.ResultPrototype}' is abstract";
+            }
+
+            if (recipe.ResultAmount < 1)
+                yield return $"recipe '{recipe.Id}' resultAmount must be at least 1";
+
+            if (!double.IsFinite(recipe.ProductionTimeSeconds) || recipe.ProductionTimeSeconds <= 0)
+                yield return $"recipe '{recipe.Id}' productionTimeSeconds must be greater than zero";
+
+            if (recipe.LatheTargets.Count == 0)
+                yield return $"recipe '{recipe.Id}' must specify at least one lathe target";
+
+            foreach (var target in recipe.LatheTargets)
+            {
+                if (!TryNormalizeLatheTarget(target, out _, out var targetError))
+                    yield return $"recipe '{recipe.Id}' has invalid target '{target}': {targetError}";
+            }
+
+            if (recipe.Materials.Count == 0)
+                yield return $"recipe '{recipe.Id}' must specify at least one material";
+
+            foreach (var (materialId, amount) in recipe.Materials)
+            {
+                if (!_prototype.HasIndex<MaterialPrototype>(materialId))
+                    yield return $"recipe '{recipe.Id}' references unknown material '{materialId}'";
+
+                if (amount <= 0)
+                    yield return $"recipe '{recipe.Id}' material '{materialId}' amount must be greater than zero";
+            }
+
+            foreach (var technologyId in recipe.TechnologyIds.Distinct(StringComparer.Ordinal))
+            {
+                if (!technologyIds.Contains(technologyId))
+                    yield return $"recipe '{recipe.Id}' references unknown weekly technology '{technologyId}'";
             }
         }
     }

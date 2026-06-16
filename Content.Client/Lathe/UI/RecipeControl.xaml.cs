@@ -12,7 +12,7 @@ public sealed partial class RecipeControl : Control
     public Action<string>? OnButtonPressed;
     public Func<string> TooltipTextSupplier;
 
-    private ProtoId<LatheRecipePrototype> _recipeId;
+    private string _recipeId;
     private LatheSystem _latheSystem;
 
     public RecipeControl(LatheSystem latheSystem, LatheRecipePrototype recipe, Func<string> tooltipTextSupplier, bool canProduce, Control displayControl)
@@ -33,10 +33,34 @@ public sealed partial class RecipeControl : Control
         Button.TooltipSupplier = SupplyTooltip;
     }
 
+    public RecipeControl(LatheSystem latheSystem, string recipeId, string recipeName, Func<string> tooltipTextSupplier, bool canProduce, Control displayControl)
+    {
+        RobustXamlLoader.Load(this);
+
+        _latheSystem = latheSystem;
+        _recipeId = recipeId;
+        TooltipTextSupplier = tooltipTextSupplier;
+        SetRecipe(recipeId, recipeName);
+        SetCanProduce(canProduce);
+        SetDisplayControl(displayControl);
+
+        Button.OnPressed += (_) =>
+        {
+            OnButtonPressed?.Invoke(_recipeId);
+        };
+        Button.TooltipSupplier = SupplyTooltip;
+    }
+
     public void SetRecipe(LatheRecipePrototype recipe)
     {
         RecipeName.Text = _latheSystem.GetRecipeName(recipe);
         _recipeId = recipe.ID;
+    }
+
+    public void SetRecipe(string recipeId, string recipeName)
+    {
+        RecipeName.Text = recipeName;
+        _recipeId = recipeId;
     }
 
     public void SetTooltipSupplier(Func<string> tooltipTextSupplier)

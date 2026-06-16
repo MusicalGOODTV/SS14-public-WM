@@ -67,8 +67,11 @@ namespace Content.Server.GameTicking
             for (var i = readyPlayers.Count - 1; i >= 0; i--)
             {
                 var player = readyPlayers[i];
-                if (_weeklyMode.IsWeeklyAccessAllowed(player, true))
+                if (_weeklyMode.IsWeeklyAccessAllowed(player, true) ||
+                    _weeklyMode.HasForcedPlaytimeBypass(player.UserId))
+                {
                     continue;
+                }
 
                 readyPlayers.RemoveAt(i);
                 profiles.Remove(player.UserId);
@@ -161,6 +164,13 @@ namespace Content.Server.GameTicking
 
             if (jobId != null)
             {
+                if (!_weeklyMode.CanLateJoinJob(player, station, jobId, out var weeklyMessage))
+                {
+                    if (weeklyMessage != null)
+                        _chatManager.DispatchServerMessage(player, weeklyMessage);
+                    return;
+                }
+
                 var jobs = new List<ProtoId<JobPrototype>> {jobId};
                 var ev = new IsRoleAllowedEvent(player, jobs, null);
                 RaiseLocalEvent(ref ev);
@@ -248,6 +258,20 @@ namespace Content.Server.GameTicking
             var jobBans = _banManager.GetJobBans(player.UserId);
             if (jobBans != null)
                 restrictedRoles.UnionWith(jobBans);
+
+            string? forcedMessage = null;
+            if (jobId == null)
+            {
+                if (_weeklyMode.TryGetForcedLateJoinJob(player, station, restrictedRoles, out var forcedJob, out forcedMessage))
+                {
+                    jobId = forcedJob.Value.Id;
+                }
+                else if (forcedMessage != null)
+                {
+                    _chatManager.DispatchServerMessage(player, forcedMessage);
+                    return;
+                }
+            }
 
             // Pick best job best on prefs.
             jobId ??= _stationJobs.PickBestAvailableJobWithPriority(station,
@@ -406,7 +430,7 @@ namespace Content.Server.GameTicking
             if (!_userDb.IsLoadComplete(player))
                 return;
 
-            if (!_weeklyMode.IsWeeklyAccessAllowed(player, true))
+            if (!_weeklyMode.IsWeeklyAccessAllowedForJob(player, jobId, true))
                 return;
 
             SpawnPlayer(player, station, jobId, silent: silent);

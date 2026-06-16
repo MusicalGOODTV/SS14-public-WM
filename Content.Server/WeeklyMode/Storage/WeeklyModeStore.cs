@@ -28,6 +28,7 @@ public sealed class WeeklyModeStore
     public const string RoleOverridesFileName = "role-overrides.json";
     public const string ContainerPatchFileName = "container-patch.json";
     public const string IntegrityFileName = "integrity.json";
+    public const string RecipesFileName = "recipes.json";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -139,6 +140,7 @@ public sealed class WeeklyModeStore
         set.DiscordChannel ??= string.Empty;
         set.WeeklyTechnologies ??= new List<WeeklyTechnologyEntry>();
         set.WeeklyCargoProducts ??= new List<WeeklyCargoProductEntry>();
+        set.ForcedRoleAssignments ??= new List<WeeklyForcedRoleAssignment>();
         set.CampaignState ??= new Dictionary<string, string>();
 
         foreach (var technology in set.WeeklyTechnologies)
@@ -153,6 +155,30 @@ public sealed class WeeklyModeStore
             product.ProductId ??= string.Empty;
             product.Category ??= string.Empty;
             product.ItemPrototype ??= string.Empty;
+        }
+
+        foreach (var assignment in set.ForcedRoleAssignments)
+        {
+            assignment.PlayerNetUserId ??= string.Empty;
+            assignment.LastKnownCKey ??= string.Empty;
+            assignment.JobId ??= string.Empty;
+            assignment.CreatedBy ??= string.Empty;
+            if (assignment.CreatedAt.Kind == DateTimeKind.Unspecified)
+                assignment.CreatedAt = DateTime.SpecifyKind(assignment.CreatedAt, DateTimeKind.Utc);
+        }
+    }
+
+    private static void NormalizeRecipes(WeeklyRecipesConfig config)
+    {
+        config.Recipes ??= new List<WeeklyRecipeDefinition>();
+
+        foreach (var recipe in config.Recipes)
+        {
+            recipe.Id ??= string.Empty;
+            recipe.ResultPrototype ??= string.Empty;
+            recipe.LatheTargets ??= new List<string>();
+            recipe.Materials ??= new Dictionary<string, int>();
+            recipe.TechnologyIds ??= new List<string>();
         }
     }
 
@@ -191,6 +217,47 @@ public sealed class WeeklyModeStore
     public ResPath SetPath(string setId)
     {
         return SetDirectory(setId) / "set.json";
+    }
+
+    public ResPath RecipesPath(string setId)
+    {
+        return SetDirectory(setId) / RecipesFileName;
+    }
+
+    public bool TryLoadRecipes(string setId, [NotNullWhen(true)] out WeeklyRecipesConfig? config)
+    {
+        config = null;
+        if (!IsSafeId(setId))
+            return false;
+
+        if (!TryReadJson(RecipesPath(setId), out config))
+            return false;
+
+        NormalizeRecipes(config);
+        return true;
+    }
+
+    public WeeklyRecipesConfig LoadRecipesOrDefault(string setId)
+    {
+        ValidateId(setId, nameof(setId));
+
+        if (!TryLoadRecipes(setId, out var config))
+            return new WeeklyRecipesConfig();
+
+        return config;
+    }
+
+    public void SaveRecipes(string setId, WeeklyRecipesConfig config)
+    {
+        ValidateId(setId, nameof(setId));
+        NormalizeRecipes(config);
+        WriteJson(RecipesPath(setId), config);
+    }
+
+    public string ExportRecipesJson(WeeklyRecipesConfig config)
+    {
+        NormalizeRecipes(config);
+        return JsonSerializer.Serialize(config, JsonOptions);
     }
 
     public ResPath SnapshotsDirectory(string setId)

@@ -506,6 +506,95 @@ public sealed class WeeklyModeStoreTest
     }
 
     [Test]
+    public void CampaignConfigPersistsForcedRoleAssignments()
+    {
+        using var ctx = CreateContext();
+        var store = ctx.Store;
+        const string setId = "season-forced-roles";
+        var set = store.CreateSet(setId, "Packed", 30, 8, baseMapPath: "/Maps/saltern.yml");
+        var userId = Guid.NewGuid();
+        var createdAt = new DateTime(2026, 06, 16, 12, 30, 00, DateTimeKind.Utc);
+
+        set.ForcedRoleAssignments.Add(new WeeklyForcedRoleAssignment
+        {
+            PlayerNetUserId = userId.ToString(),
+            LastKnownCKey = "forcedcaptain",
+            JobId = "Captain",
+            BypassPlaytime = true,
+            CreatedBy = "integration-test",
+            CreatedAt = createdAt,
+        });
+
+        store.SaveSet(set);
+
+        var loaded = store.LoadSet(setId);
+        var json = ctx.UserData.ReadAllText(store.SetPath(setId));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(loaded.ForcedRoleAssignments, Has.Count.EqualTo(1));
+            Assert.That(loaded.ForcedRoleAssignments[0].PlayerNetUserId, Is.EqualTo(userId.ToString()));
+            Assert.That(loaded.ForcedRoleAssignments[0].LastKnownCKey, Is.EqualTo("forcedcaptain"));
+            Assert.That(loaded.ForcedRoleAssignments[0].JobId, Is.EqualTo("Captain"));
+            Assert.That(loaded.ForcedRoleAssignments[0].BypassPlaytime, Is.True);
+            Assert.That(loaded.ForcedRoleAssignments[0].CreatedBy, Is.EqualTo("integration-test"));
+            Assert.That(loaded.ForcedRoleAssignments[0].CreatedAt, Is.EqualTo(createdAt));
+            Assert.That(json, Does.Contain("\"forcedRoleAssignments\""));
+            Assert.That(json, Does.Contain("\"playerNetUserId\""));
+            Assert.That(json, Does.Contain("\"bypassPlaytime\""));
+            Assert.That(json, Does.Not.Contain("\"ForcedRoleAssignments\""));
+        });
+    }
+
+    [Test]
+    public void WeeklyRecipesConfigPersistsAsSeparateJson()
+    {
+        using var ctx = CreateContext();
+        var store = ctx.Store;
+        const string setId = "season-recipes";
+        store.CreateSet(setId, "Packed", 30, 8, baseMapPath: "/Maps/saltern.yml");
+
+        var config = new WeeklyRecipesConfig
+        {
+            Recipes =
+            {
+                new WeeklyRecipeDefinition
+                {
+                    Id = "DeathSquadArmorRecipe",
+                    ResultPrototype = "ClothingOuterHardsuitDeathsquad",
+                    ResultAmount = 1,
+                    ProductionTimeSeconds = 30,
+                    LatheTargets = { "security" },
+                    Materials =
+                    {
+                        ["Steel"] = 2000,
+                        ["Plasteel"] = 6000,
+                        ["Durathread"] = 3000,
+                    },
+                    TechnologyIds = { "DeathSquadEquipment" },
+                },
+            },
+        };
+
+        store.SaveRecipes(setId, config);
+
+        Assert.That(store.TryLoadRecipes(setId, out var loaded), Is.True);
+        var json = ctx.UserData.ReadAllText(store.RecipesPath(setId));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(loaded!.Recipes, Has.Count.EqualTo(1));
+            Assert.That(loaded.Recipes[0].Id, Is.EqualTo("DeathSquadArmorRecipe"));
+            Assert.That(loaded.Recipes[0].Materials["Plasteel"], Is.EqualTo(6000));
+            Assert.That(json, Does.Contain("\"schemaVersion\""));
+            Assert.That(json, Does.Contain("\"recipes\""));
+            Assert.That(json, Does.Contain("DeathSquadArmorRecipe"));
+            Assert.That(SetDirectoryEntries(ctx.UserData, store, setId), Has.None.StartsWith(".tmp-"));
+            Assert.That(SetDirectoryEntries(ctx.UserData, store, setId), Has.None.StartsWith(".backup-"));
+        });
+    }
+
+    [Test]
     public void SnapshotRoleOverridesPersistRoleLimits()
     {
         using var ctx = CreateContext();
