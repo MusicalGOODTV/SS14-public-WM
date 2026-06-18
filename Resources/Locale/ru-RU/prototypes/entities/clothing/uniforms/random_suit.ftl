@@ -1,5 +1,5 @@
 ent-ClothingUniformRandom = { ent-ClothingUniformBase }
-    .desc = Сгенерировано нейросетью на основе последних тенденций моды.
+    .desc = Подобрано на основе последних тенденций моды.
     .suffix = Случайный вид
 ent-ClothingRandomSpawner = случайный яркий костюм
     .desc = { ent-ClothingUniformRandom.desc }
