@@ -38,6 +38,7 @@ public sealed partial class TechnologyCardControl : Control
         ResearchButton.OnPressed += _ => OnPressed?.Invoke();
     }
 
+    // Imperial Weekly Mode
     public TechnologyCardControl(WeeklyTechnologyData technology, IPrototypeManager prototypeManager, SpriteSystem spriteSys, FormattedMessage description, int points, bool hasAccess)
     {
         RobustXamlLoader.Load(this);

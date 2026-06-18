@@ -44,6 +44,7 @@ public sealed class ActionGrantSystem : EntitySystem
         }
     }
 
+    // Imperial Weekly Mode
     public int SuppressMapInitGrants(Entity<ActionGrantComponent> ent)
     {
         var suppressed = ent.Comp.Actions.Count;

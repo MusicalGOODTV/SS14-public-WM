@@ -13,8 +13,10 @@ public sealed class CargoConsoleInterfaceState : BoundUserInterfaceState
     public NetEntity Station;
     public List<CargoOrderData> Orders;
     public List<ProtoId<CargoProductPrototype>> Products;
+    // Imperial Weekly Mode
     public List<WeeklyCargoProductData> WeeklyProducts;
 
+    // Imperial Weekly Mode
     public CargoConsoleInterfaceState(
         string name,
         int count,

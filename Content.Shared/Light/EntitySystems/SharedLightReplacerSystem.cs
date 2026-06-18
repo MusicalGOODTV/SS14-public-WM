@@ -4,6 +4,7 @@ namespace Content.Shared.Light.EntitySystems;
 
 public abstract class SharedLightReplacerSystem : EntitySystem
 {
+    // Imperial Weekly Mode
     public int SuppressStartingContents(Entity<LightReplacerComponent> ent)
     {
         var suppressed = 0;

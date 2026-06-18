@@ -43,6 +43,7 @@ namespace Content.Client.Cargo.UI
         private string? _category;
 
         public List<ProtoId<CargoProductPrototype>> ProductCatalogue = new();
+        // Imperial Weekly Mode
         public List<WeeklyCargoProductData> WeeklyProductCatalogue = new();
 
         public CargoConsoleMenu(EntityUid owner, IEntityManager entMan, IPrototypeManager protoManager, SpriteSystem spriteSystem)
@@ -136,6 +137,7 @@ namespace Content.Client.Cargo.UI
             }
         }
 
+        // Imperial Weekly Mode
         private sealed class ProductDisplayData
         {
             public string ProductId = string.Empty;
@@ -148,6 +150,7 @@ namespace Content.Client.Cargo.UI
             public WeeklyCargoProductData? WeeklyProduct;
         }
 
+        // Imperial Weekly Mode
         private static string LocalizeOrLiteral(string value)
         {
             return Loc.TryGetString(value, out var localized)
@@ -155,6 +158,7 @@ namespace Content.Client.Cargo.UI
                 : value;
         }
 
+        // Imperial Weekly Mode
         private List<ProductDisplayData> BuildProductDisplayData()
         {
             var products = new List<ProductDisplayData>();
@@ -193,6 +197,7 @@ namespace Content.Client.Cargo.UI
             return products;
         }
 
+        // Imperial Weekly Mode
         public bool TryGetProductDisplayData(string productId, out string name, out string description, out int cost)
         {
             foreach (var product in BuildProductDisplayData())

@@ -132,6 +132,7 @@ public sealed class GameMapManager : IGameMapManager
 
     public GameMapPrototype? GetSelectedMap()
     {
+        // Imperial Weekly Mode
         return _selectedMap ?? _configSelectedMap;
     }
 
@@ -155,6 +156,7 @@ public sealed class GameMapManager : IGameMapManager
         _selectedMap = map;
     }
 
+    // Imperial Weekly Mode
     public void SelectMapPath(string baseMapPrototype, ResPath mapPath)
     {
         if (!TryLookupMap(baseMapPrototype, out var map))
@@ -167,6 +169,7 @@ public sealed class GameMapManager : IGameMapManager
         _log.Info($"Using map prototype {baseMapPrototype} with weekly map path {mapPath}");
     }
 
+    // Imperial Weekly Mode
     public void SelectPersistentMap(string baseMapPrototype, ResPath mapPath)
     {
         if (!TryLookupMap(baseMapPrototype, out var map))

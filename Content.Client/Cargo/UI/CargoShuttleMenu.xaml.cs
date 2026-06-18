@@ -38,6 +38,7 @@ namespace Content.Client.Cargo.UI
                  string productName;
                  Texture? icon;
 
+                 // Imperial Weekly Mode
                  if (order.IsWeeklyProduct)
                  {
                      productName = order.WeeklyProduct.Name;

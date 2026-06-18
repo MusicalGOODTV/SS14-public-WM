@@ -25,6 +25,7 @@ namespace Content.Client.GameTicking.Managers
 
         private Dictionary<NetEntity, Dictionary<ProtoId<JobPrototype>, int?>>  _jobsAvailable = new();
         private Dictionary<NetEntity, string> _stationNames = new();
+        // Imperial Weekly Mode
         private Dictionary<ProtoId<JobPrototype>, string> _jobNameOverrides = new();
 
         [ViewVariables] public bool AreWeReady { get; private set; }
@@ -40,6 +41,7 @@ namespace Content.Client.GameTicking.Managers
 
         [ViewVariables] public IReadOnlyDictionary<NetEntity, Dictionary<ProtoId<JobPrototype>, int?>> JobsAvailable => _jobsAvailable;
         [ViewVariables] public IReadOnlyDictionary<NetEntity, string> StationNames => _stationNames;
+        // Imperial Weekly Mode
         [ViewVariables] public IReadOnlyDictionary<ProtoId<JobPrototype>, string> JobNameOverrides => _jobNameOverrides;
 
         public event Action? InfoBlobUpdated;
@@ -108,6 +110,7 @@ namespace Content.Client.GameTicking.Managers
                 _stationNames[weh.Key] = weh.Value;
             }
 
+            // Imperial Weekly Mode
             _jobNameOverrides.Clear();
             foreach (var (jobId, alias) in message.JobNameOverrides)
             {
@@ -117,11 +120,13 @@ namespace Content.Client.GameTicking.Managers
             LobbyJobsAvailableUpdated?.Invoke(JobsAvailable);
         }
 
+        // Imperial Weekly Mode
         public string GetJobDisplayName(JobPrototype job)
         {
             return _jobNameOverrides.TryGetValue(job.ID, out var alias) ? alias : job.LocalizedName;
         }
 
+        // Imperial Weekly Mode
         public string GetJobDisplayName(ProtoId<JobPrototype> jobId, IPrototypeManager prototypeManager)
         {
             if (_jobNameOverrides.TryGetValue(jobId, out var alias))

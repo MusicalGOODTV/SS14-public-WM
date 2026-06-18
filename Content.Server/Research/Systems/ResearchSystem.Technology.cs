@@ -21,6 +21,7 @@ public sealed partial class ResearchSystem
         primaryDb.MainDiscipline = otherDb.MainDiscipline;
         primaryDb.CurrentTechnologyCards = otherDb.CurrentTechnologyCards;
         primaryDb.SupportedDisciplines = otherDb.SupportedDisciplines;
+        // Imperial Weekly Mode
         primaryDb.WeeklyModeOnly = otherDb.WeeklyModeOnly;
         primaryDb.WeeklyAllowedTechnologies = otherDb.WeeklyAllowedTechnologies;
         primaryDb.WeeklyTechnologies = otherDb.WeeklyTechnologies;
@@ -51,6 +52,7 @@ public sealed partial class ResearchSystem
         Sync(uid, clientComponent.Server.Value, databaseComponent, serverDatabase);
     }
 
+    // Imperial Weekly Mode
     public void SetWeeklyModeOverlay(
         EntityUid uid,
         bool enabled,
@@ -125,6 +127,7 @@ public sealed partial class ResearchSystem
         ResearchClientComponent? component = null,
         TechnologyDatabaseComponent? clientDatabase = null)
     {
+        // Imperial Weekly Mode
         if (Resolve(client, ref component, ref clientDatabase, false) && clientDatabase.WeeklyModeOnly)
             return UnlockWeeklyTechnology(client, prototypeid, user, component, clientDatabase);
 
@@ -163,6 +166,7 @@ public sealed partial class ResearchSystem
         return true;
     }
 
+    // Imperial Weekly Mode
     public bool UnlockWeeklyTechnology(EntityUid client,
         string technologyId,
         EntityUid user,
@@ -238,6 +242,7 @@ public sealed partial class ResearchSystem
         RaiseLocalEvent(uid, ref ev);
     }
 
+    // Imperial Weekly Mode
     public void AddWeeklyTechnology(EntityUid uid, WeeklyTechnologyData technology, TechnologyDatabaseComponent? component = null)
     {
         if (!Resolve(uid, ref component))
@@ -289,6 +294,7 @@ public sealed partial class ResearchSystem
         return true;
     }
 
+    // Imperial Weekly Mode
     public bool TryGetWeeklyTechnology(TechnologyDatabaseComponent database, string technologyId, out WeeklyTechnologyData technology)
     {
         foreach (var candidate in database.WeeklyTechnologies)
@@ -304,6 +310,7 @@ public sealed partial class ResearchSystem
         return false;
     }
 
+    // Imperial Weekly Mode
     public void TrySetWeeklyMainDiscipline(WeeklyTechnologyData technology, EntityUid uid, TechnologyDatabaseComponent? component = null)
     {
         if (!Resolve(uid, ref component))
@@ -327,6 +334,7 @@ public sealed partial class ResearchSystem
         component.MainDiscipline = null;
         component.CurrentTechnologyCards = new List<string>();
         component.SupportedDisciplines = new List<ProtoId<TechDisciplinePrototype>>();
+        // Imperial Weekly Mode
         component.WeeklyModeOnly = false;
         component.WeeklyAllowedTechnologies = new List<ProtoId<TechnologyPrototype>>();
         component.WeeklyTechnologies = new List<WeeklyTechnologyData>();

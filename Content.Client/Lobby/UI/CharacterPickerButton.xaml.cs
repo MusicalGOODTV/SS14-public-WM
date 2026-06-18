@@ -32,6 +32,7 @@ public sealed partial class CharacterPickerButton : ContainerButton
         ButtonGroup group,
         HumanoidCharacterProfile profile,
         bool isSelected,
+        // Imperial Weekly Mode
         Func<ProtoId<JobPrototype>, string>? getJobDisplayName = null)
     {
         RobustXamlLoader.Load(this);
@@ -45,6 +46,7 @@ public sealed partial class CharacterPickerButton : ContainerButton
         var highPriorityJob = profile.JobPriorities.SingleOrDefault(p => p.Value == JobPriority.High).Key;
         if (highPriorityJob != default)
         {
+            // Imperial Weekly Mode
             var jobName = getJobDisplayName?.Invoke(highPriorityJob) ?? prototypeManager.Index(highPriorityJob).LocalizedName;
             description = $"{description}\n{jobName}";
         }

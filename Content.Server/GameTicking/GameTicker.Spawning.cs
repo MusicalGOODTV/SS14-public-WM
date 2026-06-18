@@ -64,6 +64,7 @@ namespace Content.Server.GameTicking
             Dictionary<NetUserId, HumanoidCharacterProfile> profiles,
             bool force)
         {
+            // Imperial Weekly Mode
             for (var i = readyPlayers.Count - 1; i >= 0; i--)
             {
                 var player = readyPlayers[i];
@@ -164,6 +165,7 @@ namespace Content.Server.GameTicking
 
             if (jobId != null)
             {
+                // Imperial Weekly Mode
                 if (!_weeklyMode.CanLateJoinJob(player, station, jobId, out var weeklyMessage))
                 {
                     if (weeklyMessage != null)
@@ -259,6 +261,7 @@ namespace Content.Server.GameTicking
             if (jobBans != null)
                 restrictedRoles.UnionWith(jobBans);
 
+            // Imperial Weekly Mode
             string? forcedMessage = null;
             if (jobId == null)
             {
@@ -400,6 +403,7 @@ namespace Content.Server.GameTicking
             _mind.TransferTo(newMind, mob);
 
             _roles.MindAddJobRole(newMind, silent: silent, jobPrototype: jobId);
+            // Imperial Weekly Mode
             jobName = _weeklyMode.GetJobDisplayName(jobPrototype.ID);
             _admin.UpdatePlayerList(player);
         }
@@ -430,6 +434,7 @@ namespace Content.Server.GameTicking
             if (!_userDb.IsLoadComplete(player))
                 return;
 
+            // Imperial Weekly Mode
             if (!_weeklyMode.IsWeeklyAccessAllowedForJob(player, jobId, true))
                 return;
 

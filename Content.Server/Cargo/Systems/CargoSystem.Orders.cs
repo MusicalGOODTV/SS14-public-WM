@@ -24,7 +24,9 @@ namespace Content.Server.Cargo.Systems
 {
     public sealed partial class CargoSystem
     {
+        // Imperial Weekly Mode
         private const string WeeklyCargoCratePrototype = "CrateGenericSteel";
+        // Imperial Weekly Mode
         private const string WeeklyCargoCrateContainerId = "entity_storage";
 
         [Dependency] private readonly SharedTransformSystem _transformSystem = default!;
@@ -43,6 +45,7 @@ namespace Content.Server.Cargo.Systems
             SubscribeLocalEvent<CargoOrderConsoleComponent, GotEmaggedEvent>(OnEmagged);
         }
 
+        // Imperial Weekly Mode
         private void OnWeeklyCargoCatalogChanged(WeeklyCargoCatalogChangedEvent args)
         {
             UpdateAllOrderConsoles();
@@ -182,6 +185,7 @@ namespace Content.Server.Cargo.Systems
                 return;
             }
 
+            // Imperial Weekly Mode
             CargoProductPrototype? product = null;
             var productName = order.WeeklyProduct.Name;
             var productCost = order.WeeklyProduct.Cost;
@@ -388,6 +392,7 @@ namespace Content.Server.Cargo.Systems
             if (!TryComp<StationBankAccountComponent>(stationUid, out var bank))
                 return;
 
+            // Imperial Weekly Mode
             var targetAccount = component.Mode == CargoOrderConsoleMode.SendToPrimary ? bank.PrimaryAccount : component.Account;
             CargoOrderData data;
 
@@ -506,6 +511,7 @@ namespace Content.Server.Cargo.Systems
             return new CargoOrderData(id, cargoProduct, args.Amount, args.Requester, args.Reason, account);
         }
 
+        // Imperial Weekly Mode
         private static CargoOrderData GetOrderData(CargoConsoleAddOrderMessage args, WeeklyCargoProductData cargoProduct, int id, ProtoId<CargoAccountPrototype> account)
         {
             return new CargoOrderData(id, cargoProduct, args.Amount, args.Requester, args.Reason, account);
@@ -559,6 +565,7 @@ namespace Content.Server.Cargo.Systems
             }
         }
 
+        // Imperial Weekly Mode
         private void UpdateAllOrderConsoles()
         {
             var orderQuery = AllEntityQuery<CargoOrderConsoleComponent>();
@@ -668,6 +675,7 @@ namespace Content.Server.Cargo.Systems
         /// </summary>
         private bool FulfillOrder(CargoOrderData order, ProtoId<CargoAccountPrototype> account, EntityCoordinates spawn, string? paperProto)
         {
+            // Imperial Weekly Mode
             if (order.IsWeeklyProduct)
                 return FulfillWeeklyOrder(order, account, spawn, paperProto);
 
@@ -704,6 +712,7 @@ namespace Content.Server.Cargo.Systems
             return true;
         }
 
+        // Imperial Weekly Mode
         private bool FulfillWeeklyOrder(CargoOrderData order, ProtoId<CargoAccountPrototype> account, EntityCoordinates spawn, string? paperProto)
         {
             var product = order.WeeklyProduct;
@@ -761,6 +770,7 @@ namespace Content.Server.Cargo.Systems
             return true;
         }
 
+        // Imperial Weekly Mode
         private void PrintCargoOrderPaper(
             EntityUid item,
             CargoOrderData order,
@@ -810,6 +820,7 @@ namespace Content.Server.Cargo.Systems
 
             // Note that a market must be both on the station and on the console to be available.
             var markets = ent.Comp.AllowedGroups.Intersect(db.Markets).ToList();
+            // Imperial Weekly Mode
             if (_weeklyMode.TryGetActiveWeeklyCargoProducts(out _))
                 return products;
 
@@ -824,6 +835,7 @@ namespace Content.Server.Cargo.Systems
             return products;
         }
 
+        // Imperial Weekly Mode
         public List<WeeklyCargoProductData> GetAvailableWeeklyProducts(Entity<CargoOrderConsoleComponent> ent)
         {
             if (_station.GetOwningStation(ent) is not { } station ||

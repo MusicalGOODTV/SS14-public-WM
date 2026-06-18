@@ -56,10 +56,12 @@ public sealed partial class ResearchConsoleMenu : FancyWindow
         if (!_entity.TryGetComponent(Entity, out TechnologyDatabaseComponent? database))
             return;
 
+        // Imperial Weekly Mode
         var hasAccess = _player.LocalEntity is not { } local ||
                         !_entity.TryGetComponent<AccessReaderComponent>(Entity, out var access) ||
                         _accessReader.IsAllowed(local, Entity, access);
 
+        // Imperial Weekly Mode
         if (database.WeeklyModeOnly)
         {
             var availableWeeklyTech = _research.GetAvailableWeeklyTechnologies(Entity);
@@ -185,6 +187,7 @@ public sealed partial class ResearchConsoleMenu : FancyWindow
         }
     }
 
+    // Imperial Weekly Mode
     private void SyncWeeklyTechnologyList(BoxContainer container, IEnumerable<WeeklyTechnologyData> technologies)
     {
         container.Children.Clear();

@@ -14,7 +14,9 @@ namespace Content.Client.Research.UI;
 public sealed partial class MiniTechnologyCardControl : Control
 {
     /// The technology that this control represents
+    // Imperial Weekly Mode
     public readonly TechnologyPrototype? Technology;
+    // Imperial Weekly Mode
     public readonly string TechnologyId;
 
     public MiniTechnologyCardControl(TechnologyPrototype technology, IPrototypeManager prototypeManager, SpriteSystem spriteSys, FormattedMessage description)
@@ -33,6 +35,7 @@ public sealed partial class MiniTechnologyCardControl : Control
         TechnologyId = technology.ID;
     }
 
+    // Imperial Weekly Mode
     public MiniTechnologyCardControl(WeeklyTechnologyData technology, IPrototypeManager prototypeManager, SpriteSystem spriteSys, FormattedMessage description)
     {
         RobustXamlLoader.Load(this);

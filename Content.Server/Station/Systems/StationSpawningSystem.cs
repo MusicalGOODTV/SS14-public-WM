@@ -44,6 +44,7 @@ public sealed class StationSpawningSystem : SharedStationSpawningSystem
     [Dependency] private readonly MetaDataSystem _metaSystem = default!;
     [Dependency] private readonly PdaSystem _pdaSystem = default!;
     [Dependency] private readonly IPrototypeManager _prototypeManager = default!;
+    // Imperial Weekly Mode
     [Dependency] private readonly WeeklyModeSystem _weeklyMode = default!;
     [Dependency] private readonly MindSystem _mindSystem = default!;
 
@@ -202,6 +203,7 @@ public sealed class StationSpawningSystem : SharedStationSpawningSystem
             return;
 
         _cardSystem.TryChangeFullName(cardId, characterName, card);
+        // Imperial Weekly Mode
         _cardSystem.TryChangeJobTitle(cardId, _weeklyMode.GetJobDisplayName(jobPrototype.ID), card);
 
         if (_prototypeManager.Resolve(jobPrototype.Icon, out var jobIcon))

@@ -27,6 +27,7 @@ namespace Content.Client.Lobby.UI
         [Dependency] private readonly IResourceCache _resourceCache = default!;
         [Dependency] private readonly IConfigurationManager _cfg = default!;
         [Dependency] private readonly ISharedPlayerManager _playerManager = default!;
+        // Imperial Weekly Mode
         [Dependency] private readonly IEntityManager _entManager = default!;
 
         private readonly Button _createNewCharacterButton;
@@ -90,6 +91,7 @@ namespace Content.Client.Lobby.UI
                     ("maxCharacters", _preferencesManager.Settings!.MaxCharacterSlots));
 
             var selectedSlot = _preferencesManager.Preferences?.SelectedCharacterIndex;
+            // Imperial Weekly Mode
             var gameTicker = _entManager.System<ClientGameTicker>();
 
             foreach (var (slot, character) in _preferencesManager.Preferences!.Characters)

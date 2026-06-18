@@ -12,6 +12,7 @@ public sealed partial class RecipeControl : Control
     public Action<string>? OnButtonPressed;
     public Func<string> TooltipTextSupplier;
 
+    // Imperial Weekly Mode
     private string _recipeId;
     private LatheSystem _latheSystem;
 
@@ -33,6 +34,7 @@ public sealed partial class RecipeControl : Control
         Button.TooltipSupplier = SupplyTooltip;
     }
 
+    // Imperial Weekly Mode
     public RecipeControl(LatheSystem latheSystem, string recipeId, string recipeName, Func<string> tooltipTextSupplier, bool canProduce, Control displayControl)
     {
         RobustXamlLoader.Load(this);
@@ -57,6 +59,7 @@ public sealed partial class RecipeControl : Control
         _recipeId = recipe.ID;
     }
 
+    // Imperial Weekly Mode
     public void SetRecipe(string recipeId, string recipeName)
     {
         RecipeName.Text = recipeName;

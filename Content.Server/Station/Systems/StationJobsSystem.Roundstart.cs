@@ -85,6 +85,7 @@ public sealed partial class StationJobsSystem
             }
         }
 
+        // Imperial Weekly Mode
         _weeklyMode.ApplyForcedRoundStartAssignments(profiles, stations, stationJobs, assigned);
         if (profiles.Count == 0)
             return assigned;

@@ -42,6 +42,7 @@ namespace Content.Client.Cargo.BUI
         /// Currently selected product
         /// </summary>
         [ViewVariables]
+        // Imperial Weekly Mode
         private string _productId = string.Empty;
 
         public CargoOrderConsoleBoundUserInterface(EntityUid owner, Enum uiKey) : base(owner, uiKey)
@@ -177,6 +178,7 @@ namespace Content.Client.Cargo.BUI
             return true;
         }
 
+        // Imperial Weekly Mode
         private void RefreshSelectedProduct()
         {
             if (_menu == null ||

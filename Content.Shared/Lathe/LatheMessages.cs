@@ -10,16 +10,20 @@ public sealed class LatheUpdateState : BoundUserInterfaceState
 {
     public List<ProtoId<LatheRecipePrototype>> Recipes;
 
+    // Imperial Weekly Mode
     public List<WeeklyLatheRecipeData> WeeklyRecipes;
 
     public LatheRecipeBatch[] Queue;
 
+    // Imperial Weekly Mode
     public string? CurrentlyProducing;
 
+    // Imperial Weekly Mode
     public bool CurrentlyProducingIsWeekly;
 
     public bool UseCardId; // Imperial PrinterDoc
 
+    // Imperial Weekly Mode
     public LatheUpdateState(
         List<ProtoId<LatheRecipePrototype>> recipes,
         List<WeeklyLatheRecipeData> weeklyRecipes,

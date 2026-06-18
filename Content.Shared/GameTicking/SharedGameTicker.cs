@@ -149,6 +149,7 @@ namespace Content.Shared.GameTicking
     public sealed class TickerJobsAvailableEvent(
         Dictionary<NetEntity, string> stationNames,
         Dictionary<NetEntity, Dictionary<ProtoId<JobPrototype>, int?>> jobsAvailableByStation,
+        // Imperial Weekly Mode
         Dictionary<ProtoId<JobPrototype>, string>? jobNameOverrides = null)
         : EntityEventArgs
     {
@@ -159,6 +160,7 @@ namespace Content.Shared.GameTicking
 
         public Dictionary<NetEntity, string> StationNames { get; } = stationNames;
 
+        // Imperial Weekly Mode
         public Dictionary<ProtoId<JobPrototype>, string> JobNameOverrides { get; } = jobNameOverrides ?? new();
     }
 

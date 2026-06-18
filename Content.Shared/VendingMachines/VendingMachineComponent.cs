@@ -142,6 +142,7 @@ namespace Content.Shared.VendingMachines
         /// <summary>
         /// Skips the spawn-time inventory fill for persistent snapshots that already carry authoritative stock.
         /// </summary>
+        // Imperial Weekly Mode
         [DataField]
         public bool SuppressInitialRestock;
 

@@ -51964,7 +51964,7 @@
 /Locale/ru-RU/Imperial/ImperialClothes/ParamedicBoots.ftl鎰ent-ClothingShoesParamedic = ботинки парамедика
 /Locale/ru-RU/Imperial/ImperialClothes/ParamedicBoots.ftl鎰   .desc = На них видны потертости от быстрой ходьбы
 /Locale/ru-RU/prototypes/entities/clothing/uniforms/random_suit.ftl鎰ent-ClothingUniformRandom = { ent-ClothingUniformBase }
-/Locale/ru-RU/prototypes/entities/clothing/uniforms/random_suit.ftl鎰    .desc = Подобрано на основе последних тенденций моды.
+/Locale/ru-RU/prototypes/entities/clothing/uniforms/random_suit.ftl鎰    .desc = Сгенерировано нейросетью на основе последних тенденций моды.
 /Locale/ru-RU/prototypes/entities/clothing/uniforms/random_suit.ftl鎰    .suffix = Случайный вид
 /Locale/ru-RU/prototypes/entities/clothing/uniforms/random_suit.ftl鎰ent-ClothingRandomSpawner = случайный яркий костюм
 /Locale/ru-RU/prototypes/entities/clothing/uniforms/random_suit.ftl鎰    .desc = { ent-ClothingUniformRandom.desc }

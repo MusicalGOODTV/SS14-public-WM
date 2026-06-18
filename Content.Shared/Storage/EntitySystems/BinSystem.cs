@@ -65,6 +65,7 @@ public sealed class BinSystem : EntitySystem
         }
     }
 
+    // Imperial Weekly Mode
     public int SuppressInitialContents(Entity<BinComponent> ent)
     {
         var suppressed = ent.Comp.InitialContents.Count;

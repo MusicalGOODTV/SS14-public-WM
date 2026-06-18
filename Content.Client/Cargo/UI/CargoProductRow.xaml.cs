@@ -10,7 +10,9 @@ namespace Content.Client.Cargo.UI
     public sealed partial class CargoProductRow : BoxContainer
     {
         public CargoProductPrototype? Product { get; set; }
+        // Imperial Weekly Mode
         public WeeklyCargoProductData? WeeklyProduct { get; set; }
+        // Imperial Weekly Mode
         public string ProductId { get; set; } = string.Empty;
 
         public CargoProductRow()

@@ -16,6 +16,7 @@ public sealed class JobSystem : SharedJobSystem
     [Dependency] private readonly IChatManager _chat = default!;
     [Dependency] private readonly ISharedPlayerManager _player = default!;
     [Dependency] private readonly RoleSystem _roles = default!;
+    // Imperial Weekly Mode
     [Dependency] private readonly WeeklyModeSystem _weeklyMode = default!;
 
     public override void Initialize()
@@ -50,6 +51,7 @@ public sealed class JobSystem : SharedJobSystem
         if (!MindTryGetJob(mindId, out var prototype))
             return;
 
+        // Imperial Weekly Mode
         var jobName = _weeklyMode.GetJobDisplayName(prototype.ID);
         _chat.DispatchServerMessage(session, Loc.GetString("job-greet-introduce-job-name",
             ("jobName", CultureInfo.CurrentCulture.TextInfo.ToTitleCase(jobName))));

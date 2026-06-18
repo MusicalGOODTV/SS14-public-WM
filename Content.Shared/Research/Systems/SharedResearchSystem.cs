@@ -34,6 +34,7 @@ public abstract class SharedResearchSystem : EntitySystem
             return;
 
         component.CurrentTechnologyCards.Clear();
+        // Imperial Weekly Mode
         if (component.WeeklyModeOnly)
         {
             var availableWeeklyTechnology = GetAvailableWeeklyTechnologies(uid, component);
@@ -71,6 +72,7 @@ public abstract class SharedResearchSystem : EntitySystem
         if (!Resolve(uid, ref component, false))
             return new List<TechnologyPrototype>();
 
+        // Imperial Weekly Mode
         if (component.WeeklyModeOnly)
             return new List<TechnologyPrototype>();
 
@@ -85,6 +87,7 @@ public abstract class SharedResearchSystem : EntitySystem
         return availableTechnologies;
     }
 
+    // Imperial Weekly Mode
     public List<WeeklyTechnologyData> GetAvailableWeeklyTechnologies(EntityUid uid, TechnologyDatabaseComponent? component = null)
     {
         if (!Resolve(uid, ref component, false) || !component.WeeklyModeOnly)
@@ -126,6 +129,7 @@ public abstract class SharedResearchSystem : EntitySystem
         return true;
     }
 
+    // Imperial Weekly Mode
     public bool IsWeeklyTechnologyAvailable(TechnologyDatabaseComponent component, WeeklyTechnologyData tech, Dictionary<string, int>? disciplineTiers = null)
     {
         disciplineTiers ??= GetDisciplineTiers(component);
@@ -160,6 +164,7 @@ public abstract class SharedResearchSystem : EntitySystem
 
     public int GetHighestDisciplineTier(TechnologyDatabaseComponent component, TechDisciplinePrototype techDiscipline)
     {
+        // Imperial Weekly Mode
         if (component.WeeklyModeOnly)
             return GetHighestWeeklyDisciplineTier(component, techDiscipline);
 
@@ -203,6 +208,7 @@ public abstract class SharedResearchSystem : EntitySystem
         return tier - 1;
     }
 
+    // Imperial Weekly Mode
     private int GetHighestWeeklyDisciplineTier(TechnologyDatabaseComponent component, TechDisciplinePrototype techDiscipline)
     {
         var allTech = component.WeeklyTechnologies
@@ -237,6 +243,7 @@ public abstract class SharedResearchSystem : EntitySystem
         return tier - 1;
     }
 
+    // Imperial Weekly Mode
     private IEnumerable<TechnologyPrototype> EnumerateDatabaseTechnologies(TechnologyDatabaseComponent component)
     {
         if (!component.WeeklyModeOnly)
@@ -307,6 +314,7 @@ public abstract class SharedResearchSystem : EntitySystem
         return description;
     }
 
+    // Imperial Weekly Mode
     public FormattedMessage GetWeeklyTechnologyDescription(
         WeeklyTechnologyData technology,
         bool includeCost = true,
@@ -360,6 +368,7 @@ public abstract class SharedResearchSystem : EntitySystem
         if (!Resolve(uid, ref component, false))
             return false;
 
+        // Imperial Weekly Mode
         return component.WeeklyModeOnly
             ? component.WeeklyUnlockedTechnologies.Contains(technologyId)
             : component.UnlockedTechnologies.Contains(technologyId);
@@ -431,6 +440,7 @@ public abstract class SharedResearchSystem : EntitySystem
             comp.UnlockedTechnologies.Count == 0 && comp.WeeklyUnlockedTechnologies.Count == 0)
             return;
 
+        // Imperial Weekly Mode
         comp.UnlockedTechnologies.Clear();
         comp.WeeklyUnlockedTechnologies.Clear();
         Dirty(uid, comp);

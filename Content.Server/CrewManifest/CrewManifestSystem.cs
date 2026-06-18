@@ -26,6 +26,7 @@ public sealed class CrewManifestSystem : EntitySystem
     [Dependency] private readonly EuiManager _euiManager = default!;
     [Dependency] private readonly IConfigurationManager _configManager = default!;
     [Dependency] private readonly IPrototypeManager _prototypeManager = default!;
+    // Imperial Weekly Mode
     [Dependency] private readonly WeeklyModeSystem _weeklyMode = default!;
 
     /// <summary>
@@ -232,6 +233,7 @@ public sealed class CrewManifestSystem : EntitySystem
         {
             var record = recordObject.Item2;
             _prototypeManager.TryIndex(record.JobPrototype, out JobPrototype? job);
+            // Imperial Weekly Mode
             var jobTitle = job != null ? _weeklyMode.GetJobDisplayName(job.ID) : record.JobTitle;
             var entry = new CrewManifestEntry(record.Name, jobTitle, record.JobIcon, record.JobPrototype);
             entriesSort.Add((job, entry));

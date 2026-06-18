@@ -20,6 +20,7 @@ using Robust.Shared.Random;
 
 namespace Content.Server.Cargo.Systems;
 
+// Imperial Weekly Mode
 public readonly record struct WeeklyCargoCatalogChangedEvent;
 
 public sealed partial class CargoSystem : SharedCargoSystem
@@ -42,6 +43,7 @@ public sealed partial class CargoSystem : SharedCargoSystem
     [Dependency] private readonly UserInterfaceSystem _uiSystem = default!;
     [Dependency] private readonly MetaDataSystem _metaSystem = default!;
     [Dependency] private readonly RadioSystem _radio = default!;
+    // Imperial Weekly Mode
     [Dependency] private readonly WeeklyModeSystem _weeklyMode = default!;
 
     private EntityQuery<TransformComponent> _xformQuery;

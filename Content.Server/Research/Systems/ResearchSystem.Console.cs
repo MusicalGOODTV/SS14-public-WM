@@ -33,6 +33,7 @@ public sealed partial class ResearchSystem
         if (!this.IsPowered(uid, EntityManager))
             return;
 
+        // Imperial Weekly Mode
         TechnologyPrototype? technologyPrototype = null;
         WeeklyTechnologyData? weeklyTechnology = null;
         if (!PrototypeManager.TryIndex<TechnologyPrototype>(args.Id, out technologyPrototype))
@@ -61,6 +62,7 @@ public sealed partial class ResearchSystem
             var getIdentityEvent = new TryGetIdentityShortInfoEvent(uid, act);
             RaiseLocalEvent(getIdentityEvent);
 
+            // Imperial Weekly Mode
             var technologyName = technologyPrototype != null
                 ? Loc.GetString(technologyPrototype.Name)
                 : weeklyTechnology?.Name ?? args.Id;
@@ -103,6 +105,7 @@ public sealed partial class ResearchSystem
         _uiSystem.SetUiState(uid, ResearchConsoleUiKey.Key, state);
     }
 
+    // Imperial Weekly Mode
     public void RefreshResearchConsoles()
     {
         var query = EntityQueryEnumerator<ResearchConsoleComponent>();

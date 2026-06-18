@@ -173,6 +173,7 @@ namespace Content.Server.GameTicking
                 return;
             }
 
+            // Imperial Weekly Mode
             if (ready && !_weeklyMode.IsWeeklyAccessAllowed(player, true))
             {
                 _playerGameStatuses[player.UserId] = PlayerGameStatus.NotReadyToPlay;

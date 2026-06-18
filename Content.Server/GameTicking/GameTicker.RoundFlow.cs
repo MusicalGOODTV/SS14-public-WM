@@ -570,6 +570,7 @@ namespace Content.Server.GameTicking
                 }
 
                 var roles = _roles.MindGetAllRoleInfo(mindId);
+                // Imperial Weekly Mode
                 var firstRole = roles.FirstOrDefault();
                 var roleDisplay = firstRole.Name ?? Loc.GetString("game-ticker-unknown-role");
                 if (!antag &&

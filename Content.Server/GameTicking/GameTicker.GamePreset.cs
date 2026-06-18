@@ -200,6 +200,7 @@ public sealed partial class GameTicker
             return false;
 
         CurrentPreset = Preset;
+        // Imperial Weekly Mode
         if (_weeklyMode.ShouldSuppressAutomaticGameRules())
             return false;
 

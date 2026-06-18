@@ -288,13 +288,6 @@ BuildFiles/Windows/Godot/*
 # Working on the tools scripts is getting annoying okay?
 .mypy_cache/
 
-# Local Codex / generated report artifacts
-.codex/
-/outputs/
-
-# Local patch snapshots created during iterative PR work
-/*.patch
-
 # Windows image file caches
 Thumbs.db
 ehthumbs.db

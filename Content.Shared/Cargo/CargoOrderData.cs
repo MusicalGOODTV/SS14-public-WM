@@ -18,12 +18,15 @@ namespace Content.Shared.Cargo
         /// The ID of the cargo product ordered.
         /// </summary>
         [DataField]
+        // Imperial Weekly Mode
         public string Product = string.Empty;
 
         [DataField]
+        // Imperial Weekly Mode
         public bool IsWeeklyProduct;
 
         [DataField]
+        // Imperial Weekly Mode
         public WeeklyCargoProductData WeeklyProduct;
 
         /// <summary>
@@ -65,6 +68,7 @@ namespace Content.Shared.Cargo
             Account = account;
         }
 
+        // Imperial Weekly Mode
         public CargoOrderData(int orderId, WeeklyCargoProductData product, int amount, string requester, string reason, ProtoId<CargoAccountPrototype> account)
         {
             OrderId = orderId;

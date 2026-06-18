@@ -66,6 +66,7 @@ namespace Content.Server.GameTicking
         [Dependency] private readonly MetaDataSystem _metaData = default!;
         [Dependency] private readonly SharedRoleSystem _roles = default!;
         [Dependency] private readonly ServerDbEntryManager _dbEntryManager = default!;
+        // Imperial Weekly Mode
         [Dependency] private readonly WeeklyModeSystem _weeklyMode = default!;
 
         [ViewVariables] private bool _initialized;

@@ -59,8 +59,10 @@ using Robust.Shared.EntitySerialization.Components;
 using Robust.Shared.EntitySerialization;
 using Robust.Shared.EntitySerialization.Systems;
 using Robust.Shared.GameObjects;
+using Robust.Shared.IoC;
 using Robust.Shared.Map;
 using Robust.Shared.Map.Components;
+using Robust.Shared.Map.Events;
 using Robust.Shared.Network;
 using Robust.Shared.Serialization;
 using Robust.Shared.Serialization.Markdown;
@@ -113,6 +115,7 @@ public sealed class WeeklyModeSystem : EntitySystem
     [Dependency] private readonly SharedMindSystem _mind = default!;
     [Dependency] private readonly IPlayerLocator _playerLocator = default!;
     [Dependency] private readonly IBanManager _banManager = default!;
+    [Dependency] private readonly IDependencyCollection _dependency = default!;
 
     private readonly WeeklyModeRuntimeState _state = new();
     private readonly Dictionary<EntityUid, Dictionary<string, int?>> _originalSlots = new();
@@ -4500,14 +4503,46 @@ public sealed class WeeklyModeSystem : EntitySystem
             MissingEntityBehaviour = MissingEntityBehaviour.Ignore,
         };
 
-        _mapLoader.OnIsSerializable += Filter;
+        if (!_map.TryGetMap(mapId, out var mapUid))
+        {
+            _sawmill.Error($"Unable to find map {mapId} while saving weekly snapshot.");
+            return false;
+        }
+
+        options.Category = FileCategory.Map;
+        var serializer = new EntitySerializer(_dependency, options);
+        serializer.OnIsSerializeable += Filter;
         try
         {
-            return _mapLoader.TrySaveMap(mapId, path, out yamlUidMap, options);
+            var roots = new HashSet<EntityUid> { mapUid.Value };
+            var ev = new BeforeSerializationEvent(roots, new HashSet<MapId> { mapId }, FileCategory.Map);
+            RaiseLocalEvent(ev);
+
+            serializer.SerializeEntityRecursive(roots);
+            var data = serializer.Write();
+            var category = serializer.GetCategory();
+            if (category != FileCategory.Map)
+            {
+                _sawmill.Error($"Failed to save weekly snapshot map {mapId} as a map. Output: {category}");
+                return false;
+            }
+
+            WriteSerializedSnapshot(path, data);
+
+            var ev2 = new AfterSerializationEvent(roots, data, category);
+            RaiseLocalEvent(ev2);
+
+            yamlUidMap = new Dictionary<EntityUid, int>(serializer.YamlUidMap);
+            return true;
+        }
+        catch (Exception e)
+        {
+            _sawmill.Error($"Caught exception while trying to serialize weekly snapshot map {mapId}:\n{e}");
+            return false;
         }
         finally
         {
-            _mapLoader.OnIsSerializable -= Filter;
+            serializer.OnIsSerializeable -= Filter;
         }
     }
 

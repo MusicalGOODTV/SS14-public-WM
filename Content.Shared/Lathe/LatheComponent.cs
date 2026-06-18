@@ -83,9 +83,11 @@ namespace Content.Shared.Lathe
         /// The recipe the lathe is currently producing
         /// </summary>
         [ViewVariables]
+        // Imperial Weekly Mode
         public string? CurrentRecipe;
 
         [ViewVariables]
+        // Imperial Weekly Mode
         public bool CurrentRecipeIsWeekly;
 
         #region MachineUpgrading
@@ -122,7 +124,9 @@ namespace Content.Shared.Lathe
     [Serializable]
     public sealed partial class LatheRecipeBatch
     {
+        // Imperial Weekly Mode
         public string Recipe;
+        // Imperial Weekly Mode
         public bool IsWeekly;
         public int ItemsPrinted;
         public int ItemsRequested;
@@ -132,6 +136,7 @@ namespace Content.Shared.Lathe
         {
         }
 
+        // Imperial Weekly Mode
         public LatheRecipeBatch(string recipe, bool isWeekly, int itemsPrinted, int itemsRequested)
         {
             Recipe = recipe;

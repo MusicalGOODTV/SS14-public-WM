@@ -39,6 +39,7 @@ public sealed partial class LatheMenu : FancyWindow
 
     public List<ProtoId<LatheRecipePrototype>> Recipes = new();
 
+    // Imperial Weekly Mode
     public List<WeeklyLatheRecipeData> WeeklyRecipes = new();
 
     public List<ProtoId<LatheCategoryPrototype>>? Categories;
@@ -168,6 +169,7 @@ public sealed partial class LatheMenu : FancyWindow
             }
         }
 
+        // Imperial Weekly Mode
         var weeklyRecipesToShow = new List<WeeklyLatheRecipeData>();
         if (CurrentCategory == null)
         {
@@ -234,6 +236,7 @@ public sealed partial class LatheMenu : FancyWindow
             idx++;
         }
 
+        // Imperial Weekly Mode
         foreach (var recipe in sortedWeeklyRecipesToShow)
         {
             var canProduce = CanProduceWeeklyRecipe(recipe, quantity, lathe);
@@ -322,6 +325,7 @@ public sealed partial class LatheMenu : FancyWindow
         return sb.ToString();
     }
 
+    // Imperial Weekly Mode
     private string GenerateTooltipText(WeeklyLatheRecipeData recipe)
     {
         StringBuilder sb = new();
@@ -367,6 +371,7 @@ public sealed partial class LatheMenu : FancyWindow
         return sb.ToString();
     }
 
+    // Imperial Weekly Mode
     private bool CanProduceWeeklyRecipe(WeeklyLatheRecipeData recipe, int quantity, LatheComponent? lathe)
     {
         if (lathe == null || quantity <= 0)
@@ -433,6 +438,7 @@ public sealed partial class LatheMenu : FancyWindow
         var idx = 0;
         foreach (var batch in queue)
         {
+            // Imperial Weekly Mode
             var itemName = GetQueuedRecipeName(batch);
             string displayText;
             if (batch.ItemsRequested > 1)
@@ -473,6 +479,7 @@ public sealed partial class LatheMenu : FancyWindow
         }
     }
 
+    // Imperial Weekly Mode
     public void SetQueueInfo(string? recipeId, bool isWeekly)
     {
         FabricatingContainer.Visible = recipeId != null;
@@ -512,6 +519,7 @@ public sealed partial class LatheMenu : FancyWindow
         return new Control();
     }
 
+    // Imperial Weekly Mode
     public Control GetRecipeDisplayControl(WeeklyLatheRecipeData recipe)
     {
         if (recipe.Icon != SpriteSpecifier.Invalid)
@@ -531,6 +539,7 @@ public sealed partial class LatheMenu : FancyWindow
         return new Control();
     }
 
+    // Imperial Weekly Mode
     private string GetQueuedRecipeName(LatheRecipeBatch batch)
     {
         if (!batch.IsWeekly)
@@ -540,6 +549,7 @@ public sealed partial class LatheMenu : FancyWindow
         return string.IsNullOrWhiteSpace(recipe.Name) ? batch.Recipe : recipe.Name;
     }
 
+    // Imperial Weekly Mode
     private Control GetQueuedRecipeDisplayControl(LatheRecipeBatch batch)
     {
         if (!batch.IsWeekly)
